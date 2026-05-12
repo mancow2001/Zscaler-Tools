@@ -27,6 +27,15 @@ CERT_URLS=()               # array of URLs (repeatable --cert-url)
 CERT_URL_TIMEOUT=10        # per-URL timeout in seconds
 PATCH_AZURE_CLI=false
 PATCH_GIT=false
+PATCH_NPM=false
+PATCH_JAVA=false
+PATCH_AWS=false
+PATCH_GCLOUD=false
+PATCH_PIP=false
+PATCH_CURL=false
+PATCH_WGET=false
+PATCH_COMPOSER=false
+PATCH_ALL=false            # turns on every --patch-* flag
 FORCE=false                # skip rollback confirmation
 SCOPE="user"               # user | system
 TARGET_SHELL=""             # bash | zsh | both | (empty = auto-detect)
@@ -59,6 +68,16 @@ AUDIT_SYSTEM_STORE_OK=false
 AUDIT_GIT_CONFIGURED=false
 AUDIT_NPM_CONFIGURED=false
 AUDIT_JAVA_CONFIGURED=false
+AUDIT_AWS_CLI_CONFIGURED=false
+AUDIT_AWS_CLI_BUNDLE_VAL=""
+AUDIT_GCLOUD_CONFIGURED=false
+AUDIT_GCLOUD_BUNDLE_VAL=""
+AUDIT_PIP_CONFIG_OK=false
+AUDIT_PIP_CONFIG_VAL=""
+AUDIT_CURL_RC_OK=false
+AUDIT_WGET_RC_OK=false
+AUDIT_COMPOSER_OK=false
+AUDIT_COMPOSER_INI=""
 
 # ============================================================================
 # Helpers
@@ -792,6 +811,16 @@ run_audit() {
     AUDIT_GIT_CONFIGURED=false
     AUDIT_NPM_CONFIGURED=false
     AUDIT_JAVA_CONFIGURED=false
+    AUDIT_AWS_CLI_CONFIGURED=false
+    AUDIT_AWS_CLI_BUNDLE_VAL=""
+    AUDIT_GCLOUD_CONFIGURED=false
+    AUDIT_GCLOUD_BUNDLE_VAL=""
+    AUDIT_PIP_CONFIG_OK=false
+    AUDIT_PIP_CONFIG_VAL=""
+    AUDIT_CURL_RC_OK=false
+    AUDIT_WGET_RC_OK=false
+    AUDIT_COMPOSER_OK=false
+    AUDIT_COMPOSER_INI=""
 
     # ---- 1. System trust store ----
     write_section "[1] System Trust Store"
@@ -1124,7 +1153,17 @@ run_audit() {
     if [[ -f "$HOME/.curlrc" ]] && grep -q "^cacert" "$HOME/.curlrc" 2>/dev/null; then
         local curl_ca
         curl_ca=$(grep "^cacert" "$HOME/.curlrc" | head -1 | sed 's/^cacert[= ]*//')
-        write_status INFO "curl cacert configured in ~/.curlrc: $curl_ca"
+        if [[ -f "$curl_ca" ]]; then
+            test_bundle_has_certs "$curl_ca" "$zscaler_pem"
+            if [[ $BUNDLE_CHECK_MISSING -eq 0 && $BUNDLE_CHECK_FOUND -gt 0 ]]; then
+                write_status OK "curl cacert in ~/.curlrc: $curl_ca"
+                AUDIT_CURL_RC_OK=true
+            else
+                write_status WARN "curl cacert in ~/.curlrc: $curl_ca (missing Zscaler certs)"
+            fi
+        else
+            write_status FAIL "curl cacert in ~/.curlrc: $curl_ca (file does not exist)"
+        fi
     else
         write_status INFO "No curl cacert in ~/.curlrc"
     fi
@@ -1135,8 +1174,18 @@ run_audit() {
         if [[ -f "$wrc" ]] && grep -q "ca_certificate" "$wrc" 2>/dev/null; then
             local wget_ca
             wget_ca=$(grep "ca_certificate" "$wrc" | head -1 | sed 's/.*= *//')
-            write_status INFO "wget ca_certificate in $wrc: $wget_ca"
             wgetrc_found=true
+            if [[ "$wrc" == "$HOME/.wgetrc" && -f "$wget_ca" ]]; then
+                test_bundle_has_certs "$wget_ca" "$zscaler_pem"
+                if [[ $BUNDLE_CHECK_MISSING -eq 0 && $BUNDLE_CHECK_FOUND -gt 0 ]]; then
+                    write_status OK "wget ca_certificate in $wrc: $wget_ca"
+                    AUDIT_WGET_RC_OK=true
+                else
+                    write_status WARN "wget ca_certificate in $wrc: $wget_ca (missing Zscaler certs)"
+                fi
+            else
+                write_status INFO "wget ca_certificate in $wrc: $wget_ca"
+            fi
         fi
     done
     if ! $wgetrc_found; then
@@ -1161,6 +1210,107 @@ run_audit() {
         write_status INFO "JAVA_HOME not set; skipping keystore check"
     else
         write_status INFO "keytool not found"
+    fi
+
+    # AWS CLI
+    if command_exists aws; then
+        local aws_ca
+        aws_ca=$(get_aws_ca_bundle)
+        if [[ -n "$aws_ca" ]]; then
+            AUDIT_AWS_CLI_BUNDLE_VAL="$aws_ca"
+            if [[ -f "$aws_ca" ]]; then
+                test_bundle_has_certs "$aws_ca" "$zscaler_pem"
+                if [[ $BUNDLE_CHECK_MISSING -eq 0 && $BUNDLE_CHECK_FOUND -gt 0 ]]; then
+                    write_status OK "aws default.ca_bundle = $aws_ca"
+                    AUDIT_AWS_CLI_CONFIGURED=true
+                else
+                    write_status WARN "aws default.ca_bundle = $aws_ca (missing Zscaler certs)"
+                fi
+            else
+                write_status FAIL "aws default.ca_bundle = $aws_ca (file does not exist)"
+            fi
+        else
+            write_status INFO "aws default.ca_bundle not configured"
+        fi
+    else
+        write_status INFO "aws CLI not found"
+    fi
+
+    # Google Cloud SDK
+    if command_exists gcloud; then
+        local gcloud_ca
+        gcloud_ca=$(get_gcloud_ca_bundle)
+        if [[ -n "$gcloud_ca" ]]; then
+            AUDIT_GCLOUD_BUNDLE_VAL="$gcloud_ca"
+            if [[ -f "$gcloud_ca" ]]; then
+                test_bundle_has_certs "$gcloud_ca" "$zscaler_pem"
+                if [[ $BUNDLE_CHECK_MISSING -eq 0 && $BUNDLE_CHECK_FOUND -gt 0 ]]; then
+                    write_status OK "gcloud core/custom_ca_certs_file = $gcloud_ca"
+                    AUDIT_GCLOUD_CONFIGURED=true
+                else
+                    write_status WARN "gcloud core/custom_ca_certs_file = $gcloud_ca (missing Zscaler certs)"
+                fi
+            else
+                write_status FAIL "gcloud core/custom_ca_certs_file = $gcloud_ca (file does not exist)"
+            fi
+        else
+            write_status INFO "gcloud core/custom_ca_certs_file not configured"
+        fi
+    else
+        write_status INFO "gcloud not found"
+    fi
+
+    # pip global.cert (generic, separate from Azure CLI's pip-system-certs)
+    local pip_bin
+    pip_bin=$(find_pip)
+    if [[ -n "$pip_bin" ]]; then
+        local pip_cert
+        pip_cert=$(get_pip_config_cert)
+        if [[ -n "$pip_cert" ]]; then
+            AUDIT_PIP_CONFIG_VAL="$pip_cert"
+            if [[ -f "$pip_cert" ]]; then
+                test_bundle_has_certs "$pip_cert" "$zscaler_pem"
+                if [[ $BUNDLE_CHECK_MISSING -eq 0 && $BUNDLE_CHECK_FOUND -gt 0 ]]; then
+                    write_status OK "$pip_bin global.cert = $pip_cert"
+                    AUDIT_PIP_CONFIG_OK=true
+                else
+                    write_status WARN "$pip_bin global.cert = $pip_cert (missing Zscaler certs)"
+                fi
+            else
+                write_status FAIL "$pip_bin global.cert = $pip_cert (file does not exist)"
+            fi
+        else
+            write_status INFO "$pip_bin global.cert not configured"
+        fi
+    fi
+
+    # Composer / PHP openssl.cafile
+    if command_exists php; then
+        local php_ini
+        php_ini=$(get_php_ini)
+        if [[ -n "$php_ini" && -f "$php_ini" ]]; then
+            AUDIT_COMPOSER_INI="$php_ini"
+            local php_ca
+            php_ca=$(grep -i '^[[:space:]]*openssl\.cafile' "$php_ini" 2>/dev/null \
+                | head -1 | sed 's/^[^=]*=[[:space:]]*//; s/^"//; s/"$//')
+            if [[ -n "$php_ca" ]]; then
+                if [[ -f "$php_ca" ]]; then
+                    test_bundle_has_certs "$php_ca" "$zscaler_pem"
+                    if [[ $BUNDLE_CHECK_MISSING -eq 0 && $BUNDLE_CHECK_FOUND -gt 0 ]]; then
+                        write_status OK "PHP openssl.cafile = $php_ca"
+                        AUDIT_COMPOSER_OK=true
+                    else
+                        write_status WARN "PHP openssl.cafile = $php_ca (missing Zscaler certs)"
+                    fi
+                else
+                    write_status FAIL "PHP openssl.cafile = $php_ca (file does not exist)"
+                fi
+            else
+                write_status INFO "PHP openssl.cafile not configured ($php_ini)"
+            fi
+        elif [[ -z "$php_ini" ]]; then
+            write_status INFO "php found but no loaded php.ini"
+        fi
     fi
 
     # ---- 5. Package managers ----
@@ -1780,6 +1930,208 @@ configure_java_keystore() {
     return 0
 }
 
+# ----------------------------------------------------------------------------
+# Marker-fenced config-file helpers (curl ~/.curlrc, wget ~/.wgetrc, php.ini)
+# ----------------------------------------------------------------------------
+
+write_managed_rcfile_block() {
+    local target="$1" directive="$2"
+    [[ -z "$target" || -z "$directive" ]] && return 1
+    touch "$target" 2>/dev/null || return 1
+
+    if grep -qF "$PROFILE_MARKER_BEGIN" "$target" 2>/dev/null; then
+        local tmp
+        tmp=$(make_temp)
+        awk -v b="$PROFILE_MARKER_BEGIN" -v e="$PROFILE_MARKER_END" '
+            $0 == b { skip = 1; next }
+            skip    { if ($0 == e) skip = 0; next }
+                    { print }
+        ' "$target" > "$tmp" && cat "$tmp" > "$target"
+    fi
+
+    {
+        echo ""
+        echo "$PROFILE_MARKER_BEGIN"
+        echo "$directive"
+        echo "$PROFILE_MARKER_END"
+    } >> "$target"
+}
+
+remove_managed_rcfile_block() {
+    local target="$1"
+    [[ -f "$target" ]] || return 1
+    local tmp
+    tmp=$(make_temp)
+    awk -v b="$PROFILE_MARKER_BEGIN" -v e="$PROFILE_MARKER_END" '
+        $0 == b { skip = 1; next }
+        skip    { if ($0 == e) skip = 0; next }
+                { print }
+    ' "$target" > "$tmp" && cat "$tmp" > "$target"
+}
+
+# ----------------------------------------------------------------------------
+# AWS CLI
+# ----------------------------------------------------------------------------
+
+get_aws_ca_bundle() {
+    local cfg="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
+    [[ -f "$cfg" ]] || { echo ""; return; }
+    awk '
+        /^\[/ { section = $0; next }
+        section == "[default]" && /^[[:space:]]*ca_bundle[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            print
+            exit
+        }
+    ' "$cfg"
+}
+
+configure_aws_cli() {
+    local bundle_path="$1"
+    if ! command_exists aws; then
+        write_status INFO "AWS CLI not found. Skipping."
+        return 1
+    fi
+    write_section "Configuring AWS CLI default.ca_bundle"
+    if aws configure set default.ca_bundle "$bundle_path" 2>/dev/null; then
+        write_status OK "aws configure set default.ca_bundle $bundle_path"
+        return 0
+    fi
+    write_status FAIL "aws configure set default.ca_bundle failed"
+    return 1
+}
+
+# ----------------------------------------------------------------------------
+# Google Cloud SDK
+# ----------------------------------------------------------------------------
+
+get_gcloud_ca_bundle() {
+    command_exists gcloud || { echo ""; return; }
+    local val
+    val=$(gcloud config get-value core/custom_ca_certs_file 2>/dev/null | tr -d '\r')
+    [[ "$val" == "(unset)" || -z "$val" ]] && echo "" || echo "$val"
+}
+
+configure_gcloud() {
+    local bundle_path="$1"
+    if ! command_exists gcloud; then
+        write_status INFO "gcloud not found. Skipping."
+        return 1
+    fi
+    write_section "Configuring gcloud core/custom_ca_certs_file"
+    if gcloud config set core/custom_ca_certs_file "$bundle_path" 2>/dev/null; then
+        write_status OK "gcloud config set core/custom_ca_certs_file $bundle_path"
+        return 0
+    fi
+    write_status FAIL "gcloud config set failed"
+    return 1
+}
+
+# ----------------------------------------------------------------------------
+# pip global.cert
+# ----------------------------------------------------------------------------
+
+find_pip() {
+    if command_exists pip3; then echo "pip3"
+    elif command_exists pip; then echo "pip"
+    fi
+}
+
+get_pip_config_cert() {
+    local pip
+    pip=$(find_pip)
+    [[ -z "$pip" ]] && { echo ""; return; }
+    local val
+    val=$("$pip" config get global.cert 2>/dev/null | tr -d '\r')
+    [[ "$val" == ERROR:* ]] && val=""
+    echo "$val"
+}
+
+configure_pip_global_cert() {
+    local bundle_path="$1"
+    local pip
+    pip=$(find_pip)
+    if [[ -z "$pip" ]]; then
+        write_status INFO "pip / pip3 not found. Skipping."
+        return 1
+    fi
+    write_section "Configuring pip global.cert"
+    if "$pip" config set global.cert "$bundle_path" 2>/dev/null; then
+        write_status OK "$pip config set global.cert $bundle_path"
+        return 0
+    fi
+    write_status FAIL "$pip config set global.cert failed"
+    return 1
+}
+
+# ----------------------------------------------------------------------------
+# curl ~/.curlrc
+# ----------------------------------------------------------------------------
+
+configure_curl_rc() {
+    local bundle_path="$1"
+    if ! command_exists curl; then
+        write_status INFO "curl not found. Skipping."
+        return 1
+    fi
+    write_section "Configuring curl ~/.curlrc"
+    write_managed_rcfile_block "$HOME/.curlrc" "cacert=$bundle_path"
+    write_status OK "Wrote cacert= block to $HOME/.curlrc"
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# wget ~/.wgetrc
+# ----------------------------------------------------------------------------
+
+configure_wget_rc() {
+    local bundle_path="$1"
+    if ! command_exists wget; then
+        write_status INFO "wget not found. Skipping."
+        return 1
+    fi
+    write_section "Configuring wget ~/.wgetrc"
+    write_managed_rcfile_block "$HOME/.wgetrc" "ca_certificate=$bundle_path"
+    write_status OK "Wrote ca_certificate= block to $HOME/.wgetrc"
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# Composer (PHP)
+# ----------------------------------------------------------------------------
+
+get_php_ini() {
+    command_exists php || { echo ""; return; }
+    local ini
+    ini=$(php --ini 2>/dev/null \
+        | awk -F': *' '/^Loaded Configuration File/ {print $2; exit}' \
+        | sed 's/[[:space:]]*$//')
+    [[ "$ini" == "(none)" ]] && ini=""
+    echo "$ini"
+}
+
+configure_composer_php() {
+    local bundle_path="$1"
+    if ! command_exists php; then
+        write_status INFO "php not found. Skipping."
+        return 1
+    fi
+    local ini
+    ini=$(get_php_ini)
+    if [[ -z "$ini" ]]; then
+        write_status WARN "PHP is installed but has no loaded php.ini. Skipping."
+        return 1
+    fi
+    if [[ ! -w "$ini" ]] && ! is_root; then
+        write_status FAIL "PHP ini at $ini is not writable (try sudo). Skipping."
+        return 1
+    fi
+    write_section "Configuring PHP openssl.cafile"
+    write_managed_rcfile_block "$ini" "openssl.cafile=\"$bundle_path\""
+    write_status OK "Wrote openssl.cafile= block to $ini"
+    return 0
+}
+
 # ============================================================================
 # Rollback
 # ============================================================================
@@ -1915,6 +2267,80 @@ run_rollback() {
         fi
     fi
 
+    # ---- AWS CLI ----
+    if command_exists aws; then
+        local aws_ca
+        aws_ca=$(get_aws_ca_bundle)
+        if [[ -n "$aws_ca" ]] && is_script_bundle "$aws_ca"; then
+            plan_kinds+=("UnsetAwsBundle")
+            plan_labels+=("Remove AWS CLI default.ca_bundle")
+            plan_targets+=("$aws_ca")
+            plan_needs_admin+=(false)
+            plan_extras+=("")
+        fi
+    fi
+
+    # ---- gcloud ----
+    if command_exists gcloud; then
+        local gcloud_ca
+        gcloud_ca=$(get_gcloud_ca_bundle)
+        if [[ -n "$gcloud_ca" ]] && is_script_bundle "$gcloud_ca"; then
+            plan_kinds+=("UnsetGcloudCaCerts")
+            plan_labels+=("Unset gcloud core/custom_ca_certs_file")
+            plan_targets+=("$gcloud_ca")
+            plan_needs_admin+=(false)
+            plan_extras+=("")
+        fi
+    fi
+
+    # ---- pip global.cert (generic) ----
+    local pip_bin
+    pip_bin=$(find_pip)
+    if [[ -n "$pip_bin" ]]; then
+        local pip_cert
+        pip_cert=$(get_pip_config_cert)
+        if [[ -n "$pip_cert" ]] && is_script_bundle "$pip_cert"; then
+            plan_kinds+=("UnsetPipGlobalCert")
+            plan_labels+=("Unset pip global.cert")
+            plan_targets+=("$pip_cert")
+            plan_needs_admin+=(false)
+            plan_extras+=("$pip_bin")
+        fi
+    fi
+
+    # ---- curl ~/.curlrc ----
+    if [[ -f "$HOME/.curlrc" ]] && grep -qF "$PROFILE_MARKER_BEGIN" "$HOME/.curlrc" 2>/dev/null; then
+        plan_kinds+=("RemoveRcfileBlock")
+        plan_labels+=("Remove managed block from ~/.curlrc")
+        plan_targets+=("$HOME/.curlrc")
+        plan_needs_admin+=(false)
+        plan_extras+=("")
+    fi
+
+    # ---- wget ~/.wgetrc ----
+    if [[ -f "$HOME/.wgetrc" ]] && grep -qF "$PROFILE_MARKER_BEGIN" "$HOME/.wgetrc" 2>/dev/null; then
+        plan_kinds+=("RemoveRcfileBlock")
+        plan_labels+=("Remove managed block from ~/.wgetrc")
+        plan_targets+=("$HOME/.wgetrc")
+        plan_needs_admin+=(false)
+        plan_extras+=("")
+    fi
+
+    # ---- Composer / PHP openssl.cafile ----
+    if command_exists php; then
+        local php_ini
+        php_ini=$(get_php_ini)
+        if [[ -n "$php_ini" && -f "$php_ini" ]] && grep -qF "$PROFILE_MARKER_BEGIN" "$php_ini" 2>/dev/null; then
+            plan_kinds+=("RemoveRcfileBlock")
+            plan_labels+=("Remove managed block from $php_ini")
+            plan_targets+=("$php_ini")
+            local needs=true
+            [[ -w "$php_ini" ]] && needs=false
+            plan_needs_admin+=($needs)
+            plan_extras+=("")
+        fi
+    fi
+
     # ---- present plan ----
     write_section "Rollback Plan"
     if [[ ${#plan_kinds[@]} -eq 0 ]]; then
@@ -2039,6 +2465,49 @@ run_rollback() {
                     fi
                 done <<< "$aliases"
                 ;;
+            UnsetAwsBundle)
+                local cfg="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
+                if [[ -f "$cfg" ]]; then
+                    local tmp
+                    tmp=$(make_temp)
+                    awk '
+                        /^\[/ { section = $0; print; next }
+                        section == "[default]" && /^[[:space:]]*ca_bundle[[:space:]]*=/ { next }
+                                                { print }
+                    ' "$cfg" > "$tmp" && cat "$tmp" > "$cfg"
+                    write_status OK "Unset: aws default.ca_bundle"
+                else
+                    write_status WARN "AWS config not found: $cfg"
+                fi
+                ;;
+            UnsetGcloudCaCerts)
+                if gcloud config unset core/custom_ca_certs_file 2>/dev/null; then
+                    write_status OK "Unset: gcloud core/custom_ca_certs_file"
+                else
+                    write_status FAIL "Failed to unset gcloud config"
+                fi
+                ;;
+            UnsetPipGlobalCert)
+                local pip_bin="${plan_extras[$i]}"
+                if "$pip_bin" config unset global.cert 2>/dev/null; then
+                    write_status OK "Unset: $pip_bin global.cert"
+                else
+                    write_status FAIL "Failed to unset $pip_bin global.cert"
+                fi
+                ;;
+            RemoveRcfileBlock)
+                local rc_path="${plan_targets[$i]}"
+                if remove_managed_rcfile_block "$rc_path"; then
+                    if [[ ! -s "$rc_path" ]] || ! grep -q '[^[:space:]]' "$rc_path" 2>/dev/null; then
+                        rm -f "$rc_path"
+                        write_status OK "Removed (now empty): $rc_path"
+                    else
+                        write_status OK "Removed managed block from: $rc_path"
+                    fi
+                else
+                    write_status FAIL "Failed to edit: $rc_path"
+                fi
+                ;;
             *)
                 write_status WARN "Unknown rollback kind: ${plan_kinds[$i]}"
                 ;;
@@ -2064,7 +2533,7 @@ show_menu_options() {
     local is_admin="$1"
     # These are read from the caller's scope
     local has_recommended=false
-    ($needs_system_store || $needs_bundle || $needs_az_patch || $needs_git || $needs_npm || $needs_pip_certs || $needs_java) && has_recommended=true
+    ($needs_system_store || $needs_bundle || $needs_az_patch || $needs_git || $needs_npm || $needs_pip_certs || $needs_java || $needs_aws || $needs_gcloud || $needs_pip_cfg || $needs_curl_rc || $needs_wget_rc || $needs_composer) && has_recommended=true
 
     write_section "Suggested Next Steps"
 
@@ -2159,6 +2628,54 @@ show_menu_options() {
         fi
     fi
 
+    if command_exists aws; then
+        if $needs_aws; then
+            echo "    [8] Configure AWS CLI default.ca_bundle [recommended]"
+        else
+            printf "    \033[90m[8] Configure AWS CLI default.ca_bundle\033[0m\n"
+        fi
+    fi
+
+    if command_exists gcloud; then
+        if $needs_gcloud; then
+            echo "    [9] Configure gcloud core/custom_ca_certs_file [recommended]"
+        else
+            printf "    \033[90m[9] Configure gcloud core/custom_ca_certs_file\033[0m\n"
+        fi
+    fi
+
+    if [[ -n "$(find_pip)" ]]; then
+        if $needs_pip_cfg; then
+            echo "    [P] Configure pip global.cert (generic Python) [recommended]"
+        else
+            printf "    \033[90m[P] Configure pip global.cert (generic Python)\033[0m\n"
+        fi
+    fi
+
+    if command_exists curl; then
+        if $needs_curl_rc; then
+            echo "    [C] Configure curl ~/.curlrc [recommended]"
+        else
+            printf "    \033[90m[C] Configure curl ~/.curlrc\033[0m\n"
+        fi
+    fi
+
+    if command_exists wget; then
+        if $needs_wget_rc; then
+            echo "    [W] Configure wget ~/.wgetrc [recommended]"
+        else
+            printf "    \033[90m[W] Configure wget ~/.wgetrc\033[0m\n"
+        fi
+    fi
+
+    if command_exists php; then
+        if $needs_composer; then
+            echo "    [H] Configure PHP openssl.cafile (Composer) [recommended]"
+        else
+            printf "    \033[90m[H] Configure PHP openssl.cafile (Composer)\033[0m\n"
+        fi
+    fi
+
     printf "    \033[90m[T] Run live TLS handshake test\033[0m\n"
     printf "    \033[90m[R] Roll back all script-managed changes\033[0m\n"
     if $has_recommended; then
@@ -2187,6 +2704,12 @@ show_interactive_menu() {
     local needs_npm=false
     local needs_pip_certs=false
     local needs_java=false
+    local needs_aws=false
+    local needs_gcloud=false
+    local needs_pip_cfg=false
+    local needs_curl_rc=false
+    local needs_wget_rc=false
+    local needs_composer=false
 
     ! $AUDIT_SYSTEM_STORE_OK && needs_system_store=true
     [[ "$AUDIT_ENV_VARS_STATE" != "ok" ]] || ! $AUDIT_COMBINED_BUNDLE_OK && needs_bundle=true
@@ -2195,6 +2718,12 @@ show_interactive_menu() {
     command_exists npm && ! $AUDIT_NPM_CONFIGURED && needs_npm=true
     $AUDIT_AZURE_CLI_INSTALLED && ! $AUDIT_PIP_SYSTEM_CERTS_OK && needs_pip_certs=true
     command_exists keytool && [[ -n "${JAVA_HOME:-}" ]] && ! $AUDIT_JAVA_CONFIGURED && needs_java=true
+    command_exists aws && ! $AUDIT_AWS_CLI_CONFIGURED && needs_aws=true
+    command_exists gcloud && ! $AUDIT_GCLOUD_CONFIGURED && needs_gcloud=true
+    [[ -n "$(find_pip)" ]] && ! $AUDIT_PIP_CONFIG_OK && needs_pip_cfg=true
+    command_exists curl && ! $AUDIT_CURL_RC_OK && needs_curl_rc=true
+    command_exists wget && ! $AUDIT_WGET_RC_OK && needs_wget_rc=true
+    command_exists php && [[ -n "$AUDIT_COMPOSER_INI" ]] && ! $AUDIT_COMPOSER_OK && needs_composer=true
 
     show_menu_options "$is_admin"
 
@@ -2304,9 +2833,75 @@ show_interactive_menu() {
                     ran_something=true
                 fi
                 ;;
+            8)
+                local bp="$BUNDLE_DIR/combined-ca-bundle.pem"
+                if [[ ! -f "$bp" ]]; then
+                    write_status WARN "Combined bundle not found. Run action [2] first."
+                else
+                    if configure_aws_cli "$bp"; then
+                        needs_aws=false; AUDIT_AWS_CLI_CONFIGURED=true
+                    fi
+                    ran_something=true
+                fi
+                ;;
+            9)
+                local bp="$BUNDLE_DIR/combined-ca-bundle.pem"
+                if [[ ! -f "$bp" ]]; then
+                    write_status WARN "Combined bundle not found. Run action [2] first."
+                else
+                    if configure_gcloud "$bp"; then
+                        needs_gcloud=false; AUDIT_GCLOUD_CONFIGURED=true
+                    fi
+                    ran_something=true
+                fi
+                ;;
+            P)
+                local bp="$BUNDLE_DIR/combined-ca-bundle.pem"
+                if [[ ! -f "$bp" ]]; then
+                    write_status WARN "Combined bundle not found. Run action [2] first."
+                else
+                    if configure_pip_global_cert "$bp"; then
+                        needs_pip_cfg=false; AUDIT_PIP_CONFIG_OK=true
+                    fi
+                    ran_something=true
+                fi
+                ;;
+            C)
+                local bp="$BUNDLE_DIR/combined-ca-bundle.pem"
+                if [[ ! -f "$bp" ]]; then
+                    write_status WARN "Combined bundle not found. Run action [2] first."
+                else
+                    if configure_curl_rc "$bp"; then
+                        needs_curl_rc=false; AUDIT_CURL_RC_OK=true
+                    fi
+                    ran_something=true
+                fi
+                ;;
+            W)
+                local bp="$BUNDLE_DIR/combined-ca-bundle.pem"
+                if [[ ! -f "$bp" ]]; then
+                    write_status WARN "Combined bundle not found. Run action [2] first."
+                else
+                    if configure_wget_rc "$bp"; then
+                        needs_wget_rc=false; AUDIT_WGET_RC_OK=true
+                    fi
+                    ran_something=true
+                fi
+                ;;
+            H)
+                local bp="$BUNDLE_DIR/combined-ca-bundle.pem"
+                if [[ ! -f "$bp" ]]; then
+                    write_status WARN "Combined bundle not found. Run action [2] first."
+                else
+                    if configure_composer_php "$bp"; then
+                        needs_composer=false; AUDIT_COMPOSER_OK=true
+                    fi
+                    ran_something=true
+                fi
+                ;;
             A)
                 local has_recommended=false
-                ($needs_system_store || $needs_bundle || $needs_az_patch || $needs_git || $needs_npm || $needs_pip_certs || $needs_java) && has_recommended=true
+                ($needs_system_store || $needs_bundle || $needs_az_patch || $needs_git || $needs_npm || $needs_pip_certs || $needs_java || $needs_aws || $needs_gcloud || $needs_pip_cfg || $needs_curl_rc || $needs_wget_rc || $needs_composer) && has_recommended=true
 
                 if ! $has_recommended; then
                     write_status WARN "No recommended actions available in this context."
@@ -2359,6 +2954,16 @@ show_interactive_menu() {
                     fi
                 fi
 
+                local bp="${combined_path:-$BUNDLE_DIR/combined-ca-bundle.pem}"
+                if [[ -f "$bp" ]]; then
+                    $needs_aws      && configure_aws_cli         "$bp" && { needs_aws=false;     AUDIT_AWS_CLI_CONFIGURED=true; }
+                    $needs_gcloud   && configure_gcloud          "$bp" && { needs_gcloud=false;  AUDIT_GCLOUD_CONFIGURED=true; }
+                    $needs_pip_cfg  && configure_pip_global_cert "$bp" && { needs_pip_cfg=false; AUDIT_PIP_CONFIG_OK=true; }
+                    $needs_curl_rc  && configure_curl_rc         "$bp" && { needs_curl_rc=false; AUDIT_CURL_RC_OK=true; }
+                    $needs_wget_rc  && configure_wget_rc         "$bp" && { needs_wget_rc=false; AUDIT_WGET_RC_OK=true; }
+                    $needs_composer && configure_composer_php    "$bp" && { needs_composer=false; AUDIT_COMPOSER_OK=true; }
+                fi
+
                 write_section "All recommended actions complete"
                 echo "    Restart open shells / terminals to pick up new env vars."
                 return
@@ -2379,6 +2984,20 @@ show_interactive_menu() {
 # ============================================================================
 
 run_install() {
+    # --patch-all expands to every individual --patch-* flag
+    if $PATCH_ALL; then
+        PATCH_AZURE_CLI=true
+        PATCH_GIT=true
+        PATCH_NPM=true
+        PATCH_JAVA=true
+        PATCH_AWS=true
+        PATCH_GCLOUD=true
+        PATCH_PIP=true
+        PATCH_CURL=true
+        PATCH_WGET=true
+        PATCH_COMPOSER=true
+    fi
+
     if [[ "$SCOPE" == "system" ]] && ! is_root; then
         echo "Error: --scope system requires root." >&2
         exit 1
@@ -2430,6 +3049,46 @@ run_install() {
         configure_git "$combined_path" || true
     fi
 
+    # Optional: configure npm
+    if $PATCH_NPM; then
+        configure_npm "$combined_path" || true
+    fi
+
+    # Optional: import to Java keystore
+    if $PATCH_JAVA; then
+        configure_java_keystore "$zscaler_pem" || true
+    fi
+
+    # Optional: configure AWS CLI
+    if $PATCH_AWS; then
+        configure_aws_cli "$combined_path" || true
+    fi
+
+    # Optional: configure gcloud
+    if $PATCH_GCLOUD; then
+        configure_gcloud "$combined_path" || true
+    fi
+
+    # Optional: configure pip global.cert (generic Python)
+    if $PATCH_PIP; then
+        configure_pip_global_cert "$combined_path" || true
+    fi
+
+    # Optional: write curl ~/.curlrc
+    if $PATCH_CURL; then
+        configure_curl_rc "$combined_path" || true
+    fi
+
+    # Optional: write wget ~/.wgetrc
+    if $PATCH_WGET; then
+        configure_wget_rc "$combined_path" || true
+    fi
+
+    # Optional: configure PHP openssl.cafile (Composer)
+    if $PATCH_COMPOSER; then
+        configure_composer_php "$combined_path" || true
+    fi
+
     write_section "Done"
     echo "Restart any open shells and terminals to pick up the new env vars."
     echo "Verify with: $0 --audit --test-connection"
@@ -2465,6 +3124,15 @@ Options:
   --test-host HOST     TLS test target (default: login.microsoftonline.com)
   --patch-azure-cli    With --install: patch Azure CLI certifi bundle
   --patch-git          With --install: configure git http.sslCAInfo
+  --patch-npm          With --install: configure npm cafile
+  --patch-java         With --install: import certs into Java keystore (sudo)
+  --patch-aws          With --install: set AWS CLI default.ca_bundle
+  --patch-gcloud       With --install: set gcloud core/custom_ca_certs_file
+  --patch-pip          With --install: set pip global.cert (generic Python)
+  --patch-curl         With --install: write cacert= to ~/.curlrc
+  --patch-wget         With --install: write ca_certificate= to ~/.wgetrc
+  --patch-composer     With --install: write openssl.cafile= to php.ini (PHP)
+  --patch-all          With --install: turn on every --patch-* flag above
   --force              With --rollback: skip the y/N confirmation prompt
   --scope user|system  Env var scope (default: user). System requires root.
   --shell bash|zsh|both  Target shell profile (default: auto-detect)
@@ -2540,6 +3208,42 @@ parse_args() {
                 ;;
             --patch-git)
                 PATCH_GIT=true
+                shift
+                ;;
+            --patch-npm)
+                PATCH_NPM=true
+                shift
+                ;;
+            --patch-java)
+                PATCH_JAVA=true
+                shift
+                ;;
+            --patch-aws)
+                PATCH_AWS=true
+                shift
+                ;;
+            --patch-gcloud)
+                PATCH_GCLOUD=true
+                shift
+                ;;
+            --patch-pip)
+                PATCH_PIP=true
+                shift
+                ;;
+            --patch-curl)
+                PATCH_CURL=true
+                shift
+                ;;
+            --patch-wget)
+                PATCH_WGET=true
+                shift
+                ;;
+            --patch-composer)
+                PATCH_COMPOSER=true
+                shift
+                ;;
+            --patch-all)
+                PATCH_ALL=true
                 shift
                 ;;
             --scope)

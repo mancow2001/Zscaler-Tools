@@ -40,6 +40,45 @@
     Only with -Install. Append Zscaler certs to Azure CLI's certifi bundle.
     Requires admin.
 
+.PARAMETER PatchGit
+    Only with -Install. Configure git http.sslCAInfo to the combined bundle.
+
+.PARAMETER PatchNpm
+    Only with -Install. Set npm cafile to the combined bundle.
+
+.PARAMETER PatchJava
+    Only with -Install. Import managed certs into the JVM cacerts keystore via
+    keytool. Usually requires admin (cacerts lives under Program Files).
+
+.PARAMETER PatchAws
+    Only with -Install. Run `aws configure set default.ca_bundle <bundle>`.
+
+.PARAMETER PatchGcloud
+    Only with -Install. Run `gcloud config set core/custom_ca_certs_file <bundle>`.
+
+.PARAMETER PatchPip
+    Only with -Install. Run `pip config set global.cert <bundle>` for the first
+    pip / pip3 on PATH (generic Python; separate from the Azure CLI patches).
+
+.PARAMETER PatchCurl
+    Only with -Install. Write a `cacert=<bundle>` block to %USERPROFILE%\_curlrc.
+
+.PARAMETER PatchWget
+    Only with -Install. Write a `ca_certificate=<bundle>` block to
+    %USERPROFILE%\.wgetrc.
+
+.PARAMETER PatchComposer
+    Only with -Install. Write `openssl.cafile="<bundle>"` to the loaded php.ini
+    (detected via `php --ini`). Usually requires admin.
+
+.PARAMETER InstallToCertStore
+    Only with -Install. Import managed certs into Cert:\LocalMachine\Root (if
+    elevated) or Cert:\CurrentUser\Root (per-user, no admin).
+
+.PARAMETER PatchAll
+    Only with -Install. Turn on every individual -Patch* flag, plus
+    -InstallToCertStore. Use this for a one-shot "fix everything I have."
+
 .PARAMETER Scope
     Only with -Install. 'User' or 'Machine' env var persistence.
     Machine requires admin. Default: User.
@@ -87,6 +126,17 @@ param(
     [string]$TestHost = 'login.microsoftonline.com',
     [string]$BundleDir = (Join-Path $env:USERPROFILE 'certs'),
     [switch]$PatchAzureCli,
+    [switch]$PatchGit,
+    [switch]$PatchNpm,
+    [switch]$PatchJava,
+    [switch]$PatchAws,
+    [switch]$PatchGcloud,
+    [switch]$PatchPip,
+    [switch]$PatchCurl,
+    [switch]$PatchWget,
+    [switch]$PatchComposer,
+    [switch]$InstallToCertStore,
+    [switch]$PatchAll,
     [ValidateSet('User', 'Machine')]
     [string]$Scope = 'User',
     [string[]]$CertUrls = @(),
@@ -439,6 +489,17 @@ function Invoke-Audit {
         PipSystemCertsOk  = $false
         EnvVarsState      = 'none-set'
         CombinedBundleOk  = $false
+        SystemStoreOk     = $false   # any managed cert in LocalMachine\Root?
+        GitConfigured     = $false
+        NpmConfigured     = $false
+        JavaConfigured    = $false
+        AwsCliConfigured  = $false
+        GcloudConfigured  = $false
+        PipConfigOk       = $false
+        CurlRcOk          = $false
+        WgetRcOk          = $false
+        ComposerOk        = $false
+        ComposerIni       = $null
     }
 
     # ---- 1. Trusted certificates (Windows stores + URL sources) ----
@@ -498,6 +559,12 @@ function Invoke-Audit {
     $result.ZscalerCerts = $zscalerCerts
     $result.UrlCerts     = $urlCerts
     $result.ManagedCerts = $managedCerts
+
+    # SystemStoreOk = at least one managed cert lives in LocalMachine\Root.
+    # That's the store every user / Windows service trusts by default.
+    $result.SystemStoreOk = [bool](
+        $zscalerCerts | Where-Object { $_.StorePath -eq 'Cert:\LocalMachine\Root' }
+    )
 
     # ---- 2. CA bundle files ----
     Write-Section "[2] CA Bundle Files"
@@ -618,9 +685,210 @@ function Invoke-Audit {
         }
     }
 
-    # ---- 5. Live TLS test ----
+    # ---- 5. Tool-Specific Configuration ----
+    Write-Section "[5] Tool-Specific Configuration"
+
+    # git
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $gitCa = & git config --global --get http.sslCAInfo 2>$null
+        $gitCa = "$gitCa".Trim()
+        if ($gitCa) {
+            if (Test-Path $gitCa) {
+                $r = Test-BundleHasCerts -BundlePath $gitCa -Certs $managedCerts
+                if ($r -and $r.Missing.Count -eq 0 -and $r.Found.Count -gt 0) {
+                    Write-Status OK "git http.sslCAInfo = $gitCa"
+                    $result.GitConfigured = $true
+                } else {
+                    Write-Status WARN "git http.sslCAInfo = $gitCa (missing managed certs)"
+                }
+            } else {
+                Write-Status FAIL "git http.sslCAInfo = $gitCa (file does not exist)"
+            }
+        } else {
+            Write-Status INFO "git http.sslCAInfo not configured"
+        }
+    } else {
+        Write-Status INFO "git not found"
+    }
+
+    # npm
+    if (Get-Command npm -ErrorAction SilentlyContinue) {
+        $npmCa = & npm config get cafile 2>$null
+        $npmCa = "$npmCa".Trim()
+        if ($npmCa -and $npmCa -ne 'undefined' -and $npmCa -ne 'null') {
+            if (Test-Path $npmCa) {
+                $r = Test-BundleHasCerts -BundlePath $npmCa -Certs $managedCerts
+                if ($r -and $r.Missing.Count -eq 0 -and $r.Found.Count -gt 0) {
+                    Write-Status OK "npm cafile = $npmCa"
+                    $result.NpmConfigured = $true
+                } else {
+                    Write-Status WARN "npm cafile = $npmCa (missing managed certs)"
+                }
+            } else {
+                Write-Status FAIL "npm cafile = $npmCa (file does not exist)"
+            }
+        } else {
+            Write-Status INFO "npm cafile not configured"
+        }
+    } else {
+        Write-Status INFO "npm not found"
+    }
+
+    # Java keystore
+    $javaHome = Get-JavaHomeWindows
+    if (Get-Command keytool -ErrorAction SilentlyContinue) {
+        if ($javaHome) {
+            $cacerts = Join-Path $javaHome 'lib\security\cacerts'
+            if (Test-Path $cacerts) {
+                $listing = & keytool -list -keystore $cacerts -storepass changeit 2>$null
+                if ($listing -and ($listing -match 'zscaler')) {
+                    Write-Status OK "Java keystore contains Zscaler cert(s)"
+                    $result.JavaConfigured = $true
+                } else {
+                    Write-Status INFO "Java keystore does not contain Zscaler certs"
+                }
+                Write-Host "        Path: $cacerts"
+            } else {
+                Write-Status INFO "Java cacerts file not found at $cacerts"
+            }
+        } else {
+            Write-Status INFO "JAVA_HOME not set; skipping keystore check"
+        }
+    } else {
+        Write-Status INFO "keytool not found"
+    }
+
+    # AWS CLI
+    if (Get-Command aws -ErrorAction SilentlyContinue) {
+        $awsCa = Get-AwsCaBundle
+        if ($awsCa) {
+            if (Test-Path $awsCa) {
+                $r = Test-BundleHasCerts -BundlePath $awsCa -Certs $managedCerts
+                if ($r -and $r.Missing.Count -eq 0 -and $r.Found.Count -gt 0) {
+                    Write-Status OK "aws default.ca_bundle = $awsCa"
+                    $result.AwsCliConfigured = $true
+                } else {
+                    Write-Status WARN "aws default.ca_bundle = $awsCa (missing managed certs)"
+                }
+            } else {
+                Write-Status FAIL "aws default.ca_bundle = $awsCa (file does not exist)"
+            }
+        } else {
+            Write-Status INFO "aws default.ca_bundle not configured"
+        }
+    } else {
+        Write-Status INFO "aws CLI not found"
+    }
+
+    # gcloud
+    if (Get-Command gcloud -ErrorAction SilentlyContinue) {
+        $gcCa = Get-GcloudCaBundle
+        if ($gcCa) {
+            if (Test-Path $gcCa) {
+                $r = Test-BundleHasCerts -BundlePath $gcCa -Certs $managedCerts
+                if ($r -and $r.Missing.Count -eq 0 -and $r.Found.Count -gt 0) {
+                    Write-Status OK "gcloud core/custom_ca_certs_file = $gcCa"
+                    $result.GcloudConfigured = $true
+                } else {
+                    Write-Status WARN "gcloud core/custom_ca_certs_file = $gcCa (missing managed certs)"
+                }
+            } else {
+                Write-Status FAIL "gcloud core/custom_ca_certs_file = $gcCa (file does not exist)"
+            }
+        } else {
+            Write-Status INFO "gcloud core/custom_ca_certs_file not configured"
+        }
+    } else {
+        Write-Status INFO "gcloud not found"
+    }
+
+    # pip global.cert (generic)
+    $pipBin = Find-PipCommand
+    if ($pipBin) {
+        $pipCert = Get-PipConfigCert
+        if ($pipCert) {
+            if (Test-Path $pipCert) {
+                $r = Test-BundleHasCerts -BundlePath $pipCert -Certs $managedCerts
+                if ($r -and $r.Missing.Count -eq 0 -and $r.Found.Count -gt 0) {
+                    Write-Status OK "$pipBin global.cert = $pipCert"
+                    $result.PipConfigOk = $true
+                } else {
+                    Write-Status WARN "$pipBin global.cert = $pipCert (missing managed certs)"
+                }
+            } else {
+                Write-Status FAIL "$pipBin global.cert = $pipCert (file does not exist)"
+            }
+        } else {
+            Write-Status INFO "$pipBin global.cert not configured"
+        }
+    }
+
+    # curl rc
+    $curlRc = Get-CurlRcPath
+    if (Test-Path $curlRc) {
+        $cacertLine = Select-String -Path $curlRc -Pattern '^\s*cacert' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cacertLine) {
+            $val = $cacertLine.Line -replace '^\s*cacert\s*[= ]\s*', ''
+            $val = $val.Trim('"').Trim()
+            if ((Test-Path $val) -and ((Test-BundleHasCerts -BundlePath $val -Certs $managedCerts).Missing.Count -eq 0)) {
+                Write-Status OK "curl cacert in $curlRc`: $val"
+                $result.CurlRcOk = $true
+            } else {
+                Write-Status WARN "curl cacert in $curlRc`: $val"
+            }
+        } else {
+            Write-Status INFO "No cacert in $curlRc"
+        }
+    } else {
+        Write-Status INFO "No curl rc file at $curlRc"
+    }
+
+    # wget rc
+    $wgetRc = Get-WgetRcPath
+    if (Test-Path $wgetRc) {
+        $caLine = Select-String -Path $wgetRc -Pattern '^\s*ca_certificate' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($caLine) {
+            $val = $caLine.Line -replace '^[^=]*=\s*', ''
+            $val = $val.Trim('"').Trim()
+            if ((Test-Path $val) -and ((Test-BundleHasCerts -BundlePath $val -Certs $managedCerts).Missing.Count -eq 0)) {
+                Write-Status OK "wget ca_certificate in $wgetRc`: $val"
+                $result.WgetRcOk = $true
+            } else {
+                Write-Status WARN "wget ca_certificate in $wgetRc`: $val"
+            }
+        } else {
+            Write-Status INFO "No ca_certificate in $wgetRc"
+        }
+    } else {
+        Write-Status INFO "No wget rc file at $wgetRc"
+    }
+
+    # Composer / PHP openssl.cafile
+    if (Get-Command php -ErrorAction SilentlyContinue) {
+        $phpIni = Get-PhpIni
+        if ($phpIni) {
+            $result.ComposerIni = $phpIni
+            $caLine = Select-String -Path $phpIni -Pattern '^\s*openssl\.cafile' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($caLine) {
+                $val = $caLine.Line -replace '^[^=]*=\s*', ''
+                $val = $val.Trim('"').Trim()
+                if ((Test-Path $val) -and ((Test-BundleHasCerts -BundlePath $val -Certs $managedCerts).Missing.Count -eq 0)) {
+                    Write-Status OK "PHP openssl.cafile = $val"
+                    $result.ComposerOk = $true
+                } else {
+                    Write-Status WARN "PHP openssl.cafile = $val"
+                }
+            } else {
+                Write-Status INFO "PHP openssl.cafile not configured ($phpIni)"
+            }
+        } else {
+            Write-Status INFO "php found but no loaded php.ini"
+        }
+    }
+
+    # ---- 6. Live TLS test ----
     if ($RunTlsTest) {
-        Write-Section "[5] Live TLS Test"
+        Write-Section "[6] Live TLS Test"
         Test-TlsHandshake -Hostname $TlsHost
     }
 
@@ -810,6 +1078,425 @@ function Invoke-InstallPipSystemCerts {
     }
 }
 
+# ----------------------------------------------------------------------------
+# Windows certificate store install (LocalMachine\Root or CurrentUser\Root)
+# ----------------------------------------------------------------------------
+
+function Invoke-InstallToWindowsCertStore {
+    <#
+        Imports each managed certificate into the Windows trust store using
+        Import-Certificate. LocalMachine\Root requires admin and is visible to
+        every user on the machine. CurrentUser\Root works without admin but
+        applies only to the current user.
+    #>
+    param(
+        [System.Security.Cryptography.X509Certificates.X509Certificate2[]]$Certs,
+        [ValidateSet('LocalMachine', 'CurrentUser')]
+        [string]$Location = 'LocalMachine'
+    )
+
+    if ($Location -eq 'LocalMachine' -and -not (Test-IsAdmin)) {
+        Write-Status FAIL "Installing to LocalMachine\Root requires admin. Skipping."
+        return $false
+    }
+
+    $storePath = "Cert:\$Location\Root"
+    Write-Section "Installing certs to $storePath"
+
+    $tmpDir = Join-Path $env:TEMP "zscaler-trust-import-$(Get-Random)"
+    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+
+    $failures = 0
+    try {
+        foreach ($c in $Certs) {
+            $cn   = Get-CertCN $c
+            $file = Join-Path $tmpDir "$($c.Thumbprint).cer"
+            # X509ContentType.Cert = DER-encoded cert, which Import-Certificate accepts
+            [IO.File]::WriteAllBytes(
+                $file,
+                $c.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+            )
+            try {
+                Import-Certificate -FilePath $file -CertStoreLocation $storePath -ErrorAction Stop | Out-Null
+                Write-Status OK "Installed: $cn ($($c.Thumbprint.Substring(0,12))...)"
+            } catch {
+                $failures++
+                Write-Status FAIL "Failed to install $cn`: $($_.Exception.Message)"
+            }
+        }
+    } finally {
+        Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    return ($failures -eq 0)
+}
+
+# ----------------------------------------------------------------------------
+# git, npm, Java keystore
+# ----------------------------------------------------------------------------
+
+function Invoke-ConfigureGit {
+    param([string]$BundlePath)
+
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Write-Status INFO "git not found. Skipping."
+        return $false
+    }
+
+    Write-Section "Configuring git http.sslCAInfo"
+    & git config --global http.sslCAInfo $BundlePath
+    if ($LASTEXITCODE -eq 0) {
+        Write-Status OK "git config --global http.sslCAInfo $BundlePath"
+        return $true
+    }
+    Write-Status FAIL "git config failed (exit $LASTEXITCODE)"
+    return $false
+}
+
+function Invoke-ConfigureNpm {
+    param([string]$BundlePath)
+
+    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+        Write-Status INFO "npm not found. Skipping."
+        return $false
+    }
+
+    Write-Section "Configuring npm cafile"
+    & npm config set cafile $BundlePath
+    if ($LASTEXITCODE -eq 0) {
+        Write-Status OK "npm config set cafile $BundlePath"
+        return $true
+    }
+    Write-Status FAIL "npm config set cafile failed (exit $LASTEXITCODE)"
+    return $false
+}
+
+function Get-JavaHomeWindows {
+    if ($env:JAVA_HOME -and (Test-Path $env:JAVA_HOME)) { return $env:JAVA_HOME }
+    # Walk JavaSoft registry keys; works for both JDK and JRE installs.
+    $regPaths = @(
+        'HKLM:\SOFTWARE\JavaSoft\Java Runtime Environment',
+        'HKLM:\SOFTWARE\JavaSoft\JDK',
+        'HKLM:\SOFTWARE\JavaSoft\Java Development Kit'
+    )
+    foreach ($rp in $regPaths) {
+        if (-not (Test-Path $rp)) { continue }
+        try {
+            $cur = (Get-ItemProperty $rp -ErrorAction Stop).CurrentVersion
+            if ($cur) {
+                $vp = Join-Path $rp $cur
+                if (Test-Path $vp) {
+                    $jh = (Get-ItemProperty $vp -ErrorAction Stop).JavaHome
+                    if ($jh -and (Test-Path $jh)) { return $jh }
+                }
+            }
+        } catch { }
+    }
+    # Fallback: derive from `where java`
+    $javaCmd = (Get-Command java -ErrorAction SilentlyContinue).Source
+    if ($javaCmd) {
+        $bin = Split-Path -Parent $javaCmd
+        $home = Split-Path -Parent $bin
+        if (Test-Path (Join-Path $home 'lib\security\cacerts')) { return $home }
+    }
+    return $null
+}
+
+function Invoke-ConfigureJavaKeystore {
+    param([System.Security.Cryptography.X509Certificates.X509Certificate2[]]$Certs)
+
+    $keytool = (Get-Command keytool -ErrorAction SilentlyContinue).Source
+    if (-not $keytool) {
+        Write-Status INFO "keytool not found. Skipping."
+        return $false
+    }
+    $javaHome = Get-JavaHomeWindows
+    if (-not $javaHome) {
+        Write-Status WARN "JAVA_HOME could not be resolved. Skipping."
+        return $false
+    }
+    $cacerts = Join-Path $javaHome 'lib\security\cacerts'
+    if (-not (Test-Path $cacerts)) {
+        Write-Status WARN "cacerts not found at $cacerts. Skipping."
+        return $false
+    }
+
+    # Writing to %JAVA_HOME%\lib\security usually requires admin (Program Files).
+    if (-not (Test-IsAdmin)) {
+        try {
+            $stream = [IO.File]::OpenWrite($cacerts); $stream.Close()
+        } catch {
+            Write-Status FAIL "Java keystore $cacerts is not user-writable. Re-run as admin."
+            return $false
+        }
+    }
+
+    Write-Section "Importing Zscaler certs to Java keystore"
+    Write-Host "        Keystore: $cacerts"
+
+    $tmpDir = Join-Path $env:TEMP "zscaler-trust-keytool-$(Get-Random)"
+    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+    $failures = 0
+    try {
+        $idx = 0
+        foreach ($c in $Certs) {
+            $cn   = Get-CertCN $c
+            $alias = ($cn.ToLower() -replace '[^a-z0-9]', '-').Trim('-')
+            if (-not $alias) { $alias = "zscaler-$idx" }
+            $file = Join-Path $tmpDir "$alias.crt"
+            Set-Content -Path $file -Value (ConvertTo-Pem $c) -Encoding Ascii
+
+            # Skip if alias already present.
+            & $keytool -list -keystore $cacerts -storepass changeit -alias $alias 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Status INFO "Already in keystore: $alias ($cn)"
+                $idx++
+                continue
+            }
+
+            & $keytool -importcert -noprompt -keystore $cacerts -storepass changeit `
+                       -alias $alias -file $file 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Status OK "Imported: $alias ($cn)"
+            } else {
+                Write-Status FAIL "Failed to import: $alias ($cn)"
+                $failures++
+            }
+            $idx++
+        }
+    } finally {
+        Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    return ($failures -eq 0)
+}
+
+# ----------------------------------------------------------------------------
+# AWS CLI / gcloud / pip global.cert
+# ----------------------------------------------------------------------------
+
+function Get-AwsCaBundle {
+    $cfg = if ($env:AWS_CONFIG_FILE) { $env:AWS_CONFIG_FILE } else { Join-Path $env:USERPROFILE '.aws\config' }
+    if (-not (Test-Path $cfg)) { return $null }
+    $section = $null
+    foreach ($line in Get-Content $cfg) {
+        if ($line -match '^\s*\[(.+)\]\s*$') { $section = $matches[1]; continue }
+        if ($section -eq 'default' -and $line -match '^\s*ca_bundle\s*=\s*(.+)\s*$') {
+            return $matches[1].Trim()
+        }
+    }
+    return $null
+}
+
+function Invoke-ConfigureAwsCli {
+    param([string]$BundlePath)
+    if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {
+        Write-Status INFO "AWS CLI not found. Skipping."
+        return $false
+    }
+    Write-Section "Configuring AWS CLI default.ca_bundle"
+    & aws configure set default.ca_bundle $BundlePath
+    if ($LASTEXITCODE -eq 0) {
+        Write-Status OK "aws configure set default.ca_bundle $BundlePath"
+        return $true
+    }
+    Write-Status FAIL "aws configure set failed (exit $LASTEXITCODE)"
+    return $false
+}
+
+function Get-GcloudCaBundle {
+    if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) { return $null }
+    $val = & gcloud config get-value core/custom_ca_certs_file 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $val = "$val".Trim()
+    if (-not $val -or $val -eq '(unset)') { return $null }
+    return $val
+}
+
+function Invoke-ConfigureGcloud {
+    param([string]$BundlePath)
+    if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) {
+        Write-Status INFO "gcloud not found. Skipping."
+        return $false
+    }
+    Write-Section "Configuring gcloud core/custom_ca_certs_file"
+    & gcloud config set core/custom_ca_certs_file $BundlePath
+    if ($LASTEXITCODE -eq 0) {
+        Write-Status OK "gcloud config set core/custom_ca_certs_file $BundlePath"
+        return $true
+    }
+    Write-Status FAIL "gcloud config set failed (exit $LASTEXITCODE)"
+    return $false
+}
+
+function Find-PipCommand {
+    foreach ($cmd in @('pip3', 'pip')) {
+        if (Get-Command $cmd -ErrorAction SilentlyContinue) { return $cmd }
+    }
+    return $null
+}
+
+function Get-PipConfigCert {
+    $pip = Find-PipCommand
+    if (-not $pip) { return $null }
+    $val = & $pip config get global.cert 2>$null
+    if (-not $val) { return $null }
+    $val = "$val".Trim()
+    if ($val -like 'ERROR:*') { return $null }
+    return $val
+}
+
+function Invoke-ConfigurePipGlobalCert {
+    param([string]$BundlePath)
+    $pip = Find-PipCommand
+    if (-not $pip) {
+        Write-Status INFO "pip / pip3 not found. Skipping."
+        return $false
+    }
+    Write-Section "Configuring pip global.cert"
+    & $pip config set global.cert $BundlePath
+    if ($LASTEXITCODE -eq 0) {
+        Write-Status OK "$pip config set global.cert $BundlePath"
+        return $true
+    }
+    Write-Status FAIL "$pip config set global.cert failed (exit $LASTEXITCODE)"
+    return $false
+}
+
+# ----------------------------------------------------------------------------
+# Marker-fenced rc-file blocks (curl, wget, php.ini)
+# ----------------------------------------------------------------------------
+
+$script:PROFILE_MARKER_BEGIN = '# >>> Zscaler Trust Configuration (managed by Install-ZscalerTrust.ps1) >>>'
+$script:PROFILE_MARKER_END   = '# <<< Zscaler Trust Configuration <<<'
+
+function Write-ManagedRcfileBlock {
+    param([string]$Target, [string]$Directive)
+    if (-not (Test-Path $Target)) {
+        New-Item -ItemType File -Path $Target -Force | Out-Null
+    }
+
+    # Strip any existing managed block (literal-string match).
+    $lines = Get-Content $Target -ErrorAction SilentlyContinue
+    if ($lines -and ($lines -contains $script:PROFILE_MARKER_BEGIN)) {
+        $out  = New-Object System.Collections.Generic.List[string]
+        $skip = $false
+        foreach ($ln in $lines) {
+            if ($ln -eq $script:PROFILE_MARKER_BEGIN) { $skip = $true; continue }
+            if ($skip) {
+                if ($ln -eq $script:PROFILE_MARKER_END) { $skip = $false }
+                continue
+            }
+            $out.Add($ln)
+        }
+        Set-Content -Path $Target -Value $out -Encoding Ascii
+    }
+
+    Add-Content -Path $Target -Value ''
+    Add-Content -Path $Target -Value $script:PROFILE_MARKER_BEGIN
+    Add-Content -Path $Target -Value $Directive
+    Add-Content -Path $Target -Value $script:PROFILE_MARKER_END
+}
+
+function Remove-ManagedRcfileBlock {
+    param([string]$Target)
+    if (-not (Test-Path $Target)) { return $false }
+    $lines = Get-Content $Target
+    $out   = New-Object System.Collections.Generic.List[string]
+    $skip  = $false
+    foreach ($ln in $lines) {
+        if ($ln -eq $script:PROFILE_MARKER_BEGIN) { $skip = $true; continue }
+        if ($skip) {
+            if ($ln -eq $script:PROFILE_MARKER_END) { $skip = $false }
+            continue
+        }
+        $out.Add($ln)
+    }
+    Set-Content -Path $Target -Value $out -Encoding Ascii
+    # Delete the file if our block was the only content.
+    $remaining = (Get-Content $Target -Raw -ErrorAction SilentlyContinue).Trim()
+    if (-not $remaining) {
+        Remove-Item $Target -Force -ErrorAction SilentlyContinue
+        return 'deleted'
+    }
+    return $true
+}
+
+function Get-CurlRcPath {
+    # Windows curl reads `_curlrc` (no leading dot) by default, from
+    # %CURL_HOME% or %USERPROFILE%. See `curl --manual`.
+    if ($env:CURL_HOME) { return (Join-Path $env:CURL_HOME '_curlrc') }
+    return (Join-Path $env:USERPROFILE '_curlrc')
+}
+
+function Get-WgetRcPath {
+    # Windows wget reads %WGETRC% or %USERPROFILE%\.wgetrc / wgetrc.
+    if ($env:WGETRC) { return $env:WGETRC }
+    return (Join-Path $env:USERPROFILE '.wgetrc')
+}
+
+function Invoke-ConfigureCurlRc {
+    param([string]$BundlePath)
+    if (-not (Get-Command curl -ErrorAction SilentlyContinue) -and
+        -not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+        Write-Status INFO "curl not found. Skipping."
+        return $false
+    }
+    $rc = Get-CurlRcPath
+    Write-Section "Configuring curl $rc"
+    Write-ManagedRcfileBlock -Target $rc -Directive "cacert=$BundlePath"
+    Write-Status OK "Wrote cacert= block to $rc"
+    return $true
+}
+
+function Invoke-ConfigureWgetRc {
+    param([string]$BundlePath)
+    if (-not (Get-Command wget -ErrorAction SilentlyContinue) -and
+        -not (Get-Command wget.exe -ErrorAction SilentlyContinue)) {
+        Write-Status INFO "wget not found. Skipping."
+        return $false
+    }
+    $rc = Get-WgetRcPath
+    Write-Section "Configuring wget $rc"
+    Write-ManagedRcfileBlock -Target $rc -Directive "ca_certificate=$BundlePath"
+    Write-Status OK "Wrote ca_certificate= block to $rc"
+    return $true
+}
+
+function Get-PhpIni {
+    if (-not (Get-Command php -ErrorAction SilentlyContinue)) { return $null }
+    $output = & php --ini 2>$null
+    foreach ($line in $output) {
+        if ($line -match '^\s*Loaded Configuration File:\s*(.+)\s*$') {
+            $ini = $matches[1].Trim()
+            if ($ini -eq '(none)') { return $null }
+            return $ini
+        }
+    }
+    return $null
+}
+
+function Invoke-ConfigureComposerPhp {
+    param([string]$BundlePath)
+    if (-not (Get-Command php -ErrorAction SilentlyContinue)) {
+        Write-Status INFO "php not found. Skipping."
+        return $false
+    }
+    $ini = Get-PhpIni
+    if (-not $ini) {
+        Write-Status WARN "PHP has no loaded php.ini. Skipping."
+        return $false
+    }
+    try {
+        $stream = [IO.File]::OpenWrite($ini); $stream.Close()
+    } catch {
+        Write-Status FAIL "PHP ini at $ini is not writable. Re-run as admin."
+        return $false
+    }
+    Write-Section "Configuring PHP openssl.cafile"
+    Write-ManagedRcfileBlock -Target $ini -Directive "openssl.cafile=`"$BundlePath`""
+    Write-Status OK "Wrote openssl.cafile= block to $ini"
+    return $true
+}
+
 # ============================================================================
 # Rollback
 # ============================================================================
@@ -901,6 +1588,149 @@ function Invoke-RollbackAll {
         }
     }
 
+    # ---- git config ----
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $gitSsl = (& git config --global --get http.sslCAInfo 2>$null)
+        $gitSsl = "$gitSsl".Trim()
+        if ($gitSsl -and (Test-IsScriptBundle $gitSsl)) {
+            $plan += [pscustomobject]@{
+                Kind       = 'UnsetGitConfig'
+                Label      = 'Unset git http.sslCAInfo'
+                Target     = "http.sslCAInfo = $gitSsl"
+                NeedsAdmin = $false
+            }
+        }
+    }
+
+    # ---- npm config ----
+    if (Get-Command npm -ErrorAction SilentlyContinue) {
+        $npmCa = (& npm config get cafile 2>$null)
+        $npmCa = "$npmCa".Trim()
+        if ($npmCa -and $npmCa -ne 'undefined' -and $npmCa -ne 'null' -and (Test-IsScriptBundle $npmCa)) {
+            $plan += [pscustomobject]@{
+                Kind       = 'UnsetNpmConfig'
+                Label      = 'Remove npm cafile config'
+                Target     = "cafile = $npmCa"
+                NeedsAdmin = $false
+            }
+        }
+    }
+
+    # ---- Java keystore ----
+    $javaHome = Get-JavaHomeWindows
+    if ((Get-Command keytool -ErrorAction SilentlyContinue) -and $javaHome) {
+        $cacerts = Join-Path $javaHome 'lib\security\cacerts'
+        if (Test-Path $cacerts) {
+            $listing = & keytool -list -keystore $cacerts -storepass changeit 2>$null
+            if ($listing -and ($listing -match 'zscaler')) {
+                $plan += [pscustomobject]@{
+                    Kind       = 'RemoveJavaKeystoreCerts'
+                    Label      = 'Remove Zscaler certs from Java keystore'
+                    Target     = $cacerts
+                    NeedsAdmin = $true   # cacerts in Program Files
+                }
+            }
+        }
+    }
+
+    # ---- AWS CLI ----
+    if (Get-Command aws -ErrorAction SilentlyContinue) {
+        $awsCa = Get-AwsCaBundle
+        if ($awsCa -and (Test-IsScriptBundle $awsCa)) {
+            $plan += [pscustomobject]@{
+                Kind       = 'UnsetAwsBundle'
+                Label      = 'Remove AWS CLI default.ca_bundle'
+                Target     = $awsCa
+                NeedsAdmin = $false
+            }
+        }
+    }
+
+    # ---- gcloud ----
+    if (Get-Command gcloud -ErrorAction SilentlyContinue) {
+        $gcCa = Get-GcloudCaBundle
+        if ($gcCa -and (Test-IsScriptBundle $gcCa)) {
+            $plan += [pscustomobject]@{
+                Kind       = 'UnsetGcloudCaCerts'
+                Label      = 'Unset gcloud core/custom_ca_certs_file'
+                Target     = $gcCa
+                NeedsAdmin = $false
+            }
+        }
+    }
+
+    # ---- pip global.cert (generic) ----
+    $pipBin = Find-PipCommand
+    if ($pipBin) {
+        $pipCert = Get-PipConfigCert
+        if ($pipCert -and (Test-IsScriptBundle $pipCert)) {
+            $plan += [pscustomobject]@{
+                Kind       = 'UnsetPipGlobalCert'
+                Label      = 'Unset pip global.cert'
+                Target     = $pipCert
+                NeedsAdmin = $false
+                PipBin     = $pipBin
+            }
+        }
+    }
+
+    # ---- curl rc ----
+    $curlRc = Get-CurlRcPath
+    if ((Test-Path $curlRc) -and (Select-String -Path $curlRc -SimpleMatch $script:PROFILE_MARKER_BEGIN -Quiet)) {
+        $plan += [pscustomobject]@{
+            Kind       = 'RemoveRcfileBlock'
+            Label      = "Remove managed block from $curlRc"
+            Target     = $curlRc
+            NeedsAdmin = $false
+        }
+    }
+
+    # ---- wget rc ----
+    $wgetRc = Get-WgetRcPath
+    if ((Test-Path $wgetRc) -and (Select-String -Path $wgetRc -SimpleMatch $script:PROFILE_MARKER_BEGIN -Quiet)) {
+        $plan += [pscustomobject]@{
+            Kind       = 'RemoveRcfileBlock'
+            Label      = "Remove managed block from $wgetRc"
+            Target     = $wgetRc
+            NeedsAdmin = $false
+        }
+    }
+
+    # ---- Composer / PHP openssl.cafile ----
+    if (Get-Command php -ErrorAction SilentlyContinue) {
+        $phpIni = Get-PhpIni
+        if ($phpIni -and (Test-Path $phpIni) -and `
+            (Select-String -Path $phpIni -SimpleMatch $script:PROFILE_MARKER_BEGIN -Quiet)) {
+            $iniWritable = $true
+            try { $s = [IO.File]::OpenWrite($phpIni); $s.Close() } catch { $iniWritable = $false }
+            $plan += [pscustomobject]@{
+                Kind       = 'RemoveRcfileBlock'
+                Label      = "Remove managed block from $phpIni"
+                Target     = $phpIni
+                NeedsAdmin = (-not $iniWritable)
+            }
+        }
+    }
+
+    # ---- Zscaler certs in Windows trust stores ----
+    # Only remove from stores that this script could have added them to (Root).
+    # We don't touch certs the user/admin placed there before our intervention
+    # unless they match a managed cert we currently see.
+    foreach ($loc in @('LocalMachine', 'CurrentUser')) {
+        $storePath = "Cert:\$loc\Root"
+        $storeCerts = Get-ChildItem $storePath -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Subject -match 'Zscaler' -or $_.Issuer -match 'Zscaler' }
+        if ($storeCerts) {
+            $plan += [pscustomobject]@{
+                Kind       = 'RemoveCertFromStore'
+                Label      = "Remove Zscaler cert(s) from $storePath"
+                Target     = $storePath
+                NeedsAdmin = ($loc -eq 'LocalMachine')
+                StoreCerts = $storeCerts
+            }
+        }
+    }
+
     # ---- present plan ----
     Write-Section "Rollback Plan"
     if ($plan.Count -eq 0) {
@@ -975,6 +1805,93 @@ function Invoke-RollbackAll {
                         Write-Status FAIL "pip uninstall failed (exit $LASTEXITCODE)"
                     }
                 }
+                'UnsetGitConfig' {
+                    & git config --global --unset http.sslCAInfo 2>$null
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Status OK "Unset: git http.sslCAInfo"
+                    } else {
+                        Write-Status FAIL "Failed to unset git config (exit $LASTEXITCODE)"
+                    }
+                }
+                'UnsetNpmConfig' {
+                    & npm config delete cafile 2>$null
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Status OK "Removed: npm cafile"
+                    } else {
+                        Write-Status FAIL "Failed to remove npm cafile (exit $LASTEXITCODE)"
+                    }
+                }
+                'RemoveJavaKeystoreCerts' {
+                    $cacerts = $p.Target
+                    $listing = & keytool -list -keystore $cacerts -storepass changeit 2>$null
+                    foreach ($line in $listing) {
+                        if ($line -match '^([^,]+),.*zscaler' -or $line -match '^(zscaler[^,]*),') {
+                            $alias = $matches[1].Trim()
+                            & keytool -delete -keystore $cacerts -storepass changeit -alias $alias 2>$null
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-Status OK "Removed from keystore: $alias"
+                            } else {
+                                Write-Status FAIL "Failed to remove: $alias"
+                            }
+                        }
+                    }
+                }
+                'UnsetAwsBundle' {
+                    # Strip the ca_bundle line under [default] in ~/.aws/config.
+                    $cfg = if ($env:AWS_CONFIG_FILE) { $env:AWS_CONFIG_FILE } else { Join-Path $env:USERPROFILE '.aws\config' }
+                    if (Test-Path $cfg) {
+                        $out = New-Object System.Collections.Generic.List[string]
+                        $section = $null
+                        foreach ($line in Get-Content $cfg) {
+                            if ($line -match '^\s*\[(.+)\]\s*$') {
+                                $section = $matches[1]; $out.Add($line); continue
+                            }
+                            if ($section -eq 'default' -and $line -match '^\s*ca_bundle\s*=') { continue }
+                            $out.Add($line)
+                        }
+                        Set-Content -Path $cfg -Value $out -Encoding Ascii
+                        Write-Status OK "Unset: aws default.ca_bundle"
+                    } else {
+                        Write-Status WARN "AWS config not found: $cfg"
+                    }
+                }
+                'UnsetGcloudCaCerts' {
+                    & gcloud config unset core/custom_ca_certs_file 2>$null
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Status OK "Unset: gcloud core/custom_ca_certs_file"
+                    } else {
+                        Write-Status FAIL "Failed to unset gcloud config (exit $LASTEXITCODE)"
+                    }
+                }
+                'UnsetPipGlobalCert' {
+                    & $p.PipBin config unset global.cert 2>$null
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Status OK "Unset: $($p.PipBin) global.cert"
+                    } else {
+                        Write-Status FAIL "Failed to unset $($p.PipBin) global.cert (exit $LASTEXITCODE)"
+                    }
+                }
+                'RemoveRcfileBlock' {
+                    $r = Remove-ManagedRcfileBlock -Target $p.Target
+                    if ($r -eq 'deleted') {
+                        Write-Status OK "Removed (now empty): $($p.Target)"
+                    } elseif ($r) {
+                        Write-Status OK "Removed managed block from: $($p.Target)"
+                    } else {
+                        Write-Status FAIL "Failed to edit: $($p.Target)"
+                    }
+                }
+                'RemoveCertFromStore' {
+                    foreach ($c in $p.StoreCerts) {
+                        try {
+                            $certPath = Join-Path $p.Target $c.Thumbprint
+                            Remove-Item -Path $certPath -Force -ErrorAction Stop
+                            Write-Status OK "Removed from $($p.Target): $(Get-CertCN $c) ($($c.Thumbprint.Substring(0,12))...)"
+                        } catch {
+                            Write-Status FAIL "Failed to remove $($c.Thumbprint): $($_.Exception.Message)"
+                        }
+                    }
+                }
                 default {
                     Write-Status WARN "Unknown rollback kind: $($p.Kind)"
                 }
@@ -1017,8 +1934,27 @@ function Show-InteractiveMenu {
     # Visible = Available AND (this user has the privilege to run it)
     $actions = [ordered]@{}
 
-    $needsBundle = ($AuditResult.EnvVarsState -ne 'ok') -or (-not $AuditResult.CombinedBundleOk)
+    # [1] Install certs to LocalMachine\Root (admin) - "system trust store" equivalent
+    $needsSystemStore = -not $AuditResult.SystemStoreOk
     $actions['1'] = [pscustomobject]@{
+        Label       = 'Install certs to Windows trust store (LocalMachine\Root)'
+        Recommended = $needsSystemStore
+        NeedsAdmin  = $true
+        Available   = $true
+        Run         = { Invoke-InstallToWindowsCertStore -Certs $AuditResult.ManagedCerts -Location 'LocalMachine' | Out-Null }
+    }
+
+    # [U] Install to CurrentUser\Root (no admin) - per-user fallback
+    $actions['U'] = [pscustomobject]@{
+        Label       = 'Install certs to Windows trust store (CurrentUser\Root, no admin)'
+        Recommended = $false
+        NeedsAdmin  = $false
+        Available   = -not $AuditResult.SystemStoreOk
+        Run         = { Invoke-InstallToWindowsCertStore -Certs $AuditResult.ManagedCerts -Location 'CurrentUser' | Out-Null }
+    }
+
+    $needsBundle = ($AuditResult.EnvVarsState -ne 'ok') -or (-not $AuditResult.CombinedBundleOk)
+    $actions['2'] = [pscustomobject]@{
         Label       = 'Install combined CA bundle and set env vars (User scope)'
         Recommended = $needsBundle
         NeedsAdmin  = $false
@@ -1030,7 +1966,7 @@ function Show-InteractiveMenu {
     }
 
     $needsPatch = $AuditResult.AzureCliInstalled -and -not $AuditResult.AzureCliBundleOk
-    $actions['2'] = [pscustomobject]@{
+    $actions['3'] = [pscustomobject]@{
         Label       = "Patch Azure CLI certifi bundle (fixes 'az login')"
         Recommended = $needsPatch
         NeedsAdmin  = $true
@@ -1038,8 +1974,34 @@ function Show-InteractiveMenu {
         Run         = { Invoke-PatchAzureCliBundle -Certs $AuditResult.ManagedCerts | Out-Null }
     }
 
+    $needsGit = ([bool](Get-Command git -ErrorAction SilentlyContinue)) -and -not $AuditResult.GitConfigured
+    $actions['4'] = [pscustomobject]@{
+        Label       = 'Configure git http.sslCAInfo'
+        Recommended = $needsGit
+        NeedsAdmin  = $false
+        Available   = [bool](Get-Command git -ErrorAction SilentlyContinue)
+        Run         = {
+            $bp = Join-Path $BundleDir 'combined-ca-bundle.pem'
+            if (-not (Test-Path $bp)) { Write-Status WARN "Combined bundle not found. Run action [2] first."; return }
+            Invoke-ConfigureGit -BundlePath $bp | Out-Null
+        }
+    }
+
+    $needsNpm = ([bool](Get-Command npm -ErrorAction SilentlyContinue)) -and -not $AuditResult.NpmConfigured
+    $actions['5'] = [pscustomobject]@{
+        Label       = 'Configure npm cafile'
+        Recommended = $needsNpm
+        NeedsAdmin  = $false
+        Available   = [bool](Get-Command npm -ErrorAction SilentlyContinue)
+        Run         = {
+            $bp = Join-Path $BundleDir 'combined-ca-bundle.pem'
+            if (-not (Test-Path $bp)) { Write-Status WARN "Combined bundle not found. Run action [2] first."; return }
+            Invoke-ConfigureNpm -BundlePath $bp | Out-Null
+        }
+    }
+
     $needsPip = $AuditResult.AzureCliInstalled -and -not $AuditResult.PipSystemCertsOk
-    $actions['3'] = [pscustomobject]@{
+    $actions['6'] = [pscustomobject]@{
         Label       = 'Install pip-system-certs in Azure CLI Python (best long-term fix)'
         Recommended = $needsPip
         NeedsAdmin  = $true
@@ -1047,7 +2009,96 @@ function Show-InteractiveMenu {
         Run         = { Invoke-InstallPipSystemCerts -PythonExe $AuditResult.AzureCliPython | Out-Null }
     }
 
-    $actions['4'] = [pscustomobject]@{
+    $needsJava = ([bool](Get-Command keytool -ErrorAction SilentlyContinue)) -and `
+                 ([bool](Get-JavaHomeWindows)) -and -not $AuditResult.JavaConfigured
+    $actions['7'] = [pscustomobject]@{
+        Label       = 'Import certs to Java keystore'
+        Recommended = $needsJava
+        NeedsAdmin  = $true
+        Available   = ([bool](Get-Command keytool -ErrorAction SilentlyContinue)) -and ([bool](Get-JavaHomeWindows))
+        Run         = { Invoke-ConfigureJavaKeystore -Certs $AuditResult.ManagedCerts | Out-Null }
+    }
+
+    $needsAws = ([bool](Get-Command aws -ErrorAction SilentlyContinue)) -and -not $AuditResult.AwsCliConfigured
+    $actions['8'] = [pscustomobject]@{
+        Label       = 'Configure AWS CLI default.ca_bundle'
+        Recommended = $needsAws
+        NeedsAdmin  = $false
+        Available   = [bool](Get-Command aws -ErrorAction SilentlyContinue)
+        Run         = {
+            $bp = Join-Path $BundleDir 'combined-ca-bundle.pem'
+            if (-not (Test-Path $bp)) { Write-Status WARN "Combined bundle not found. Run action [2] first."; return }
+            Invoke-ConfigureAwsCli -BundlePath $bp | Out-Null
+        }
+    }
+
+    $needsGcloud = ([bool](Get-Command gcloud -ErrorAction SilentlyContinue)) -and -not $AuditResult.GcloudConfigured
+    $actions['9'] = [pscustomobject]@{
+        Label       = 'Configure gcloud core/custom_ca_certs_file'
+        Recommended = $needsGcloud
+        NeedsAdmin  = $false
+        Available   = [bool](Get-Command gcloud -ErrorAction SilentlyContinue)
+        Run         = {
+            $bp = Join-Path $BundleDir 'combined-ca-bundle.pem'
+            if (-not (Test-Path $bp)) { Write-Status WARN "Combined bundle not found. Run action [2] first."; return }
+            Invoke-ConfigureGcloud -BundlePath $bp | Out-Null
+        }
+    }
+
+    $needsPipCfg = ([bool](Find-PipCommand)) -and -not $AuditResult.PipConfigOk
+    $actions['P'] = [pscustomobject]@{
+        Label       = 'Configure pip global.cert (generic Python)'
+        Recommended = $needsPipCfg
+        NeedsAdmin  = $false
+        Available   = [bool](Find-PipCommand)
+        Run         = {
+            $bp = Join-Path $BundleDir 'combined-ca-bundle.pem'
+            if (-not (Test-Path $bp)) { Write-Status WARN "Combined bundle not found. Run action [2] first."; return }
+            Invoke-ConfigurePipGlobalCert -BundlePath $bp | Out-Null
+        }
+    }
+
+    $needsCurlRc = ([bool](Get-Command curl -ErrorAction SilentlyContinue)) -and -not $AuditResult.CurlRcOk
+    $actions['C'] = [pscustomobject]@{
+        Label       = 'Configure curl _curlrc'
+        Recommended = $needsCurlRc
+        NeedsAdmin  = $false
+        Available   = [bool](Get-Command curl -ErrorAction SilentlyContinue)
+        Run         = {
+            $bp = Join-Path $BundleDir 'combined-ca-bundle.pem'
+            if (-not (Test-Path $bp)) { Write-Status WARN "Combined bundle not found. Run action [2] first."; return }
+            Invoke-ConfigureCurlRc -BundlePath $bp | Out-Null
+        }
+    }
+
+    $needsWgetRc = ([bool](Get-Command wget -ErrorAction SilentlyContinue)) -and -not $AuditResult.WgetRcOk
+    $actions['W'] = [pscustomobject]@{
+        Label       = 'Configure wget .wgetrc'
+        Recommended = $needsWgetRc
+        NeedsAdmin  = $false
+        Available   = [bool](Get-Command wget -ErrorAction SilentlyContinue)
+        Run         = {
+            $bp = Join-Path $BundleDir 'combined-ca-bundle.pem'
+            if (-not (Test-Path $bp)) { Write-Status WARN "Combined bundle not found. Run action [2] first."; return }
+            Invoke-ConfigureWgetRc -BundlePath $bp | Out-Null
+        }
+    }
+
+    $needsComposer = ([bool](Get-Command php -ErrorAction SilentlyContinue)) -and `
+                     [bool]$AuditResult.ComposerIni -and -not $AuditResult.ComposerOk
+    $actions['H'] = [pscustomobject]@{
+        Label       = 'Configure PHP openssl.cafile (Composer)'
+        Recommended = $needsComposer
+        NeedsAdmin  = $false
+        Available   = [bool](Get-Command php -ErrorAction SilentlyContinue) -and [bool]$AuditResult.ComposerIni
+        Run         = {
+            $bp = Join-Path $BundleDir 'combined-ca-bundle.pem'
+            if (-not (Test-Path $bp)) { Write-Status WARN "Combined bundle not found. Run action [2] first."; return }
+            Invoke-ConfigureComposerPhp -BundlePath $bp | Out-Null
+        }
+    }
+
+    $actions['T'] = [pscustomobject]@{
         Label       = "Run live TLS handshake test"
         Recommended = $false
         NeedsAdmin  = $false
@@ -1060,7 +2111,7 @@ function Show-InteractiveMenu {
         }
     }
 
-    $actions['5'] = [pscustomobject]@{
+    $actions['R'] = [pscustomobject]@{
         Label       = 'Roll back all script-managed changes'
         Recommended = $false
         NeedsAdmin  = $false   # detects + skips admin items if not elevated
@@ -1179,6 +2230,21 @@ function Show-MenuOptions {
 # ============================================================================
 
 function Invoke-Install {
+    # -PatchAll turns every individual -Patch* flag on.
+    if ($script:PatchAll) {
+        $script:PatchAzureCli = $true
+        $script:PatchGit      = $true
+        $script:PatchNpm      = $true
+        $script:PatchJava     = $true
+        $script:PatchAws      = $true
+        $script:PatchGcloud   = $true
+        $script:PatchPip      = $true
+        $script:PatchCurl     = $true
+        $script:PatchWget     = $true
+        $script:PatchComposer = $true
+        $script:InstallToCertStore = $true
+    }
+
     if ($Scope -eq 'Machine' -and -not (Test-IsAdmin)) {
         throw "Scope 'Machine' requires running as administrator."
     }
@@ -1208,11 +2274,26 @@ function Invoke-Install {
         throw "No certificates available from any source. Aborting."
     }
 
+    # Optional: install to Windows cert store. LocalMachine if elevated, else CurrentUser.
+    if ($InstallToCertStore) {
+        $loc = if (Test-IsAdmin) { 'LocalMachine' } else { 'CurrentUser' }
+        Invoke-InstallToWindowsCertStore -Certs $managedCerts -Location $loc | Out-Null
+    }
+
     $combined = Invoke-WriteBundles -Certs $managedCerts
     Invoke-SetEnvVars -BundlePath $combined -EnvScope $Scope | Out-Null
     if ($PatchAzureCli) {
         Invoke-PatchAzureCliBundle -Certs $managedCerts | Out-Null
     }
+    if ($PatchGit)      { Invoke-ConfigureGit          -BundlePath $combined | Out-Null }
+    if ($PatchNpm)      { Invoke-ConfigureNpm          -BundlePath $combined | Out-Null }
+    if ($PatchJava)     { Invoke-ConfigureJavaKeystore -Certs $managedCerts  | Out-Null }
+    if ($PatchAws)      { Invoke-ConfigureAwsCli       -BundlePath $combined | Out-Null }
+    if ($PatchGcloud)   { Invoke-ConfigureGcloud       -BundlePath $combined | Out-Null }
+    if ($PatchPip)      { Invoke-ConfigurePipGlobalCert -BundlePath $combined | Out-Null }
+    if ($PatchCurl)     { Invoke-ConfigureCurlRc       -BundlePath $combined | Out-Null }
+    if ($PatchWget)     { Invoke-ConfigureWgetRc       -BundlePath $combined | Out-Null }
+    if ($PatchComposer) { Invoke-ConfigureComposerPhp  -BundlePath $combined | Out-Null }
 
     Write-Section "Done"
     Write-Host "Restart any open shells, terminals, and VS Code to pick up the new env vars."

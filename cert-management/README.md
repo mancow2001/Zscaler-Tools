@@ -2,7 +2,9 @@
 
 **Author:** Nathan Bray
 
-Scripts to audit and install Zscaler root certificate trust on Linux/Unix and Windows systems. Many development tools (Python, Node.js, Git, Azure CLI, Java) maintain their own certificate stores and do not automatically trust certificates installed at the OS level. These scripts detect gaps and fix them.
+Scripts to audit and install Zscaler root certificate trust on Linux/Unix, macOS, and Windows. Many development tools maintain their own certificate stores and do not automatically trust certificates installed at the OS level; these scripts detect the gaps and fix them.
+
+Coverage tracks the Zscaler help guide *Adding Custom Certificate to an Application-Specific Trust Store*.
 
 ---
 
@@ -10,10 +12,40 @@ Scripts to audit and install Zscaler root certificate trust on Linux/Unix and Wi
 
 | Script | Platform | Shell |
 |--------|----------|-------|
-| `install-zscaler-trust.sh` | Linux/Unix (RHEL, CentOS, Fedora, Debian, Ubuntu) | Bash |
+| `install-zscaler-trust.sh` | Linux/Unix (RHEL, CentOS, Fedora, Debian, Ubuntu, OpenSUSE) | Bash |
+| `install-zscaler-trust-macos.sh` | macOS (Apple Silicon and Intel) | Bash |
 | `Install-ZscalerTrust.ps1` | Windows | PowerShell 5.0+ |
 
-Both scripts provide the same core workflow: **Audit** the current state of certificate trust, **Install** certificates and configure tools, or **Rollback** all changes.
+All three scripts share the same workflow: **Audit** the current trust state, **Install** certificates and configure tools, or **Rollback** every change the script could have applied.
+
+---
+
+## Application coverage
+
+Each row maps to a section in the Zscaler help guide. ✅ = configured automatically (audit + install + rollback). ⚙️ = covered indirectly by env vars the script sets. ➖ = N/A on that platform.
+
+| Application | What the script does | Linux | macOS | Windows |
+|---|---|:---:|:---:|:---:|
+| System trust store | Install root certs to the OS store (sudo / admin) | ✅ `update-ca-trust` / `update-ca-certificates` | ✅ System + Login keychain | ✅ `Cert:\LocalMachine\Root` + `CurrentUser\Root` |
+| Python `requests` | `REQUESTS_CA_BUNDLE` env var | ✅ | ✅ | ✅ |
+| pip env vars | `PIP_CERT`, `SSL_CERT_FILE` | ✅ | ✅ | ✅ |
+| pip config | `pip config set global.cert <bundle>` | ✅ `--patch-pip` | ✅ `--patch-pip` | ✅ `-PatchPip` |
+| pip-system-certs | Install package into Azure CLI Python | ✅ | ✅ | ✅ |
+| npm | `cafile` + `NODE_EXTRA_CA_CERTS` | ✅ `--patch-npm` | ✅ `--patch-npm` | ✅ `-PatchNpm` |
+| Java keytool | Import into JVM `cacerts` | ✅ `--patch-java` | ✅ `--patch-java` | ✅ `-PatchJava` |
+| Git | `git config --global http.sslCAInfo` | ✅ `--patch-git` | ✅ `--patch-git` | ✅ `-PatchGit` |
+| cURL | `cacert=` block in `~/.curlrc` (or `_curlrc` on Windows) + `CURL_CA_BUNDLE` | ✅ `--patch-curl` | ✅ `--patch-curl` | ✅ `-PatchCurl` |
+| GNU Wget | `ca_certificate=` block in `~/.wgetrc` | ✅ `--patch-wget` | ✅ `--patch-wget` | ✅ `-PatchWget` |
+| AWS CLI / Boto | `aws configure set default.ca_bundle` | ✅ `--patch-aws` | ✅ `--patch-aws` | ✅ `-PatchAws` |
+| Google Cloud SDK | `gcloud config set core/custom_ca_certs_file` | ✅ `--patch-gcloud` | ✅ `--patch-gcloud` | ✅ `-PatchGcloud` |
+| Azure CLI | Append cert to bundled `certifi` cacert.pem | ✅ `--patch-azure-cli` | ✅ `--patch-azure-cli` | ✅ `-PatchAzureCli` |
+| Composer (PHP) | `openssl.cafile=` block in loaded `php.ini` | ✅ `--patch-composer` | ✅ `--patch-composer` | ✅ `-PatchComposer` |
+| Ruby / gem | `SSL_CERT_FILE` env var | ⚙️ | ⚙️ | ⚙️ |
+| Databricks Connect | `REQUESTS_CA_BUNDLE` env var | ⚙️ | ⚙️ | ⚙️ |
+| Rust (Linux) | OS trust store | ⚙️ | ➖ | ➖ |
+| Fastlane (Linux) | OS trust store | ⚙️ | ➖ | ➖ |
+| Snowflake ODBC | not configured — Snowflake uses cert pinning, requires SSL-inspection bypass list (see help guide) | ❌ | ❌ | ❌ |
+| Android Studio, IntelliJ, Firefox, Edge, Salesforce Data Loader | not configured — GUI-driven or very narrow audience | ❌ | ❌ | ❌ |
 
 ---
 
@@ -21,10 +53,10 @@ Both scripts provide the same core workflow: **Audit** the current state of cert
 
 | Mode | Description |
 |------|-------------|
-| **Default** (no flags) | Runs an audit then presents an interactive menu |
-| **Audit** | Read-only scan of certificate trust status across all detected tools |
-| **Install** | Non-interactive installation of certificates and environment configuration |
-| **Rollback** | Removes all certificates, environment variables, and patches applied by the script |
+| **Default** (no flags) | Audit then interactive menu |
+| **Audit** | Read-only scan of every supported target |
+| **Install** | Non-interactive — runs whichever `--patch-*` flags are set |
+| **Rollback** | Detect and undo every script-managed change |
 
 ---
 
@@ -40,27 +72,29 @@ Both scripts provide the same core workflow: **Audit** the current state of cert
 # Audit with a live TLS handshake test
 ./install-zscaler-trust.sh --audit --test-connection
 
-# Non-interactive install from a local PEM file
+# Non-interactive install — bundle + env vars only, no tool patches
 ./install-zscaler-trust.sh --install --cert-file /path/to/zscaler.pem
 
-# Install by fetching certificates from a URL
-./install-zscaler-trust.sh --install --cert-url https://it.corp.example.com/root.cer
+# One-shot: do every available patch on every detected tool
+sudo ./install-zscaler-trust.sh --install --cert-file zscaler.pem --patch-all
 
-# Install from multiple sources
+# Cherry-pick patches
+./install-zscaler-trust.sh --install --cert-file zscaler.pem \
+    --patch-git --patch-npm --patch-aws --patch-gcloud --patch-pip
+
+# Fetch certs from one or more URLs instead of a file
 ./install-zscaler-trust.sh --install \
-  --cert-url https://it.corp.example.com/root.cer \
-  --cert-url https://proxy.corp.example.com
+    --cert-url https://it.corp.example.com/root.cer \
+    --cert-url https://proxy.corp.example.com \
+    --patch-all
 
-# Install with Azure CLI and Git patching
-./install-zscaler-trust.sh --install --patch-azure-cli --patch-git
-
-# System-wide installation (requires root)
-sudo ./install-zscaler-trust.sh --install --scope system
+# System-wide installation (requires root; writes /etc/profile.d/zscaler-trust.sh)
+sudo ./install-zscaler-trust.sh --install --scope system --patch-all
 
 # Rollback all changes
 ./install-zscaler-trust.sh --rollback
 
-# Force rollback without confirmation prompt
+# Force rollback without confirmation
 ./install-zscaler-trust.sh --rollback --force
 ```
 
@@ -68,25 +102,76 @@ sudo ./install-zscaler-trust.sh --install --scope system
 
 ```
 Modes (mutually exclusive):
-  --audit                   Audit only, no changes made
-  --install                 Non-interactive install
-  --rollback                Undo all script-managed changes
-  (no flag)                 Audit + interactive menu
+  --audit                Audit only, no changes
+  --install              Non-interactive install
+  --rollback             Undo all script-managed changes
+  (no flag)              Audit + interactive menu
 
-Options:
-  --cert-file FILE          PEM file containing Zscaler certificate(s)
-  --cert-url URL            Fetch certs from URL (repeatable)
-  --cert-url-timeout N      Timeout per URL in seconds (default: 10)
-  --bundle-dir DIR          Output directory for PEM files (default: ~/certs)
-  --test-connection         Include TLS handshake test in audit
-  --test-host HOST          TLS test target (default: login.microsoftonline.com)
-  --patch-azure-cli         Patch Azure CLI certifi bundle
-  --patch-git               Configure git http.sslCAInfo
-  --force                   Skip confirmation with --rollback
-  --scope user|system       Env var scope (default: user; system needs root)
-  --shell bash|zsh|both     Target shell profile (default: auto-detect)
-  -h, --help                Show help
+Cert sources:
+  --cert-file FILE       Local PEM/DER file containing Zscaler cert(s)
+  --cert-url URL         Fetch certs from URL (repeatable). HTTP download for
+                         .cer/.crt/.pem/.der URLs; TLS handshake otherwise
+  --cert-url-timeout N   Per-URL timeout, seconds (default: 10)
+  --bundle-dir DIR       Output directory for bundles (default: ~/certs)
+
+Patch flags (only with --install; each is opt-in):
+  --patch-azure-cli      Patch Azure CLI's bundled certifi cacert.pem
+  --patch-git            git config --global http.sslCAInfo
+  --patch-npm            npm config set cafile
+  --patch-java           keytool import into JVM cacerts (needs sudo)
+  --patch-aws            aws configure set default.ca_bundle
+  --patch-gcloud         gcloud config set core/custom_ca_certs_file
+  --patch-pip            pip config set global.cert (generic Python)
+  --patch-curl           Write cacert= block to ~/.curlrc
+  --patch-wget           Write ca_certificate= block to ~/.wgetrc
+  --patch-composer       Write openssl.cafile= block to php.ini
+  --patch-all            Turn on every --patch-* flag above
+
+Other:
+  --test-connection      Live TLS handshake test in audit
+  --test-host HOST       TLS test target (default: login.microsoftonline.com)
+  --scope user|system    Env var scope (default: user; system needs sudo)
+  --shell bash|zsh|both  Target shell profile (default: auto-detect)
+  --force                With --rollback: skip the y/N confirmation prompt
+  -h, --help             Show help
 ```
+
+---
+
+## macOS Usage
+
+```bash
+# Interactive mode (audit + menu)
+./install-zscaler-trust-macos.sh
+
+# Audit only
+./install-zscaler-trust-macos.sh --audit
+
+# One-shot: fix every detected tool (admin path patches go via sudo)
+sudo ./install-zscaler-trust-macos.sh --install --cert-file zscaler.pem --patch-all
+
+# No-sudo path: write user-scope env vars and per-user tool configs only
+./install-zscaler-trust-macos.sh --install --cert-file zscaler.pem \
+    --patch-git --patch-npm --patch-aws --patch-gcloud --patch-pip --patch-curl
+
+# Fetch from URLs
+./install-zscaler-trust-macos.sh --install \
+    --cert-url https://it.corp.example.com/root.cer \
+    --patch-all
+
+# Rollback all changes (system-keychain cleanup needs sudo)
+sudo ./install-zscaler-trust-macos.sh --rollback --force
+```
+
+The macOS menu also exposes an extra `[L]` option to add certs to the **Login keychain** without admin — useful when you can't get sudo but still want Safari and Apple-framework tools to trust the Zscaler intercept in your user session. Option `[1]` (System keychain) still requires sudo.
+
+### macOS Options
+
+Same shape as the Linux options above, with these differences:
+
+- `--shell` auto-detects to `zsh` (macOS default since Catalina).
+- `--scope system` writes `/etc/zscaler-trust.sh` and sources it from `/etc/zprofile` and `/etc/profile`.
+- `--patch-java` resolves `JAVA_HOME` via `/usr/libexec/java_home` if the env var is unset.
 
 ---
 
@@ -99,23 +184,27 @@ Options:
 # Audit only
 .\Install-ZscalerTrust.ps1 -Audit
 
-# Audit with a live TLS handshake test
-.\Install-ZscalerTrust.ps1 -Audit -TestConnection
-
-# Non-interactive install
+# Non-interactive install — bundle + env vars only
 .\Install-ZscalerTrust.ps1 -Install
 
-# Install with Azure CLI patching (may require admin)
-.\Install-ZscalerTrust.ps1 -Install -PatchAzureCli
+# One-shot: fix every detected tool (also imports into LocalMachine\Root if elevated)
+.\Install-ZscalerTrust.ps1 -Install -PatchAll
 
-# Machine-wide install (requires admin)
-.\Install-ZscalerTrust.ps1 -Install -Scope Machine
+# Cherry-pick patches
+.\Install-ZscalerTrust.ps1 -Install -PatchGit -PatchNpm -PatchAws -PatchGcloud -PatchPip
 
-# Fetch certificates from one or more URLs
+# Install certs into the Windows trust store (separately from -PatchAll)
+.\Install-ZscalerTrust.ps1 -Install -InstallToCertStore     # admin -> LocalMachine\Root
+.\Install-ZscalerTrust.ps1 -Install -InstallToCertStore     # non-admin -> CurrentUser\Root
+
+# Machine-wide env-var scope (requires admin)
+.\Install-ZscalerTrust.ps1 -Install -Scope Machine -PatchAll
+
+# Fetch certs from one or more URLs
 .\Install-ZscalerTrust.ps1 -Install -CertUrls @(
     'https://it.corp.example.com/root.cer',
     'https://internal-app.corp.example.com'
-)
+) -PatchAll
 
 # Rollback all changes
 .\Install-ZscalerTrust.ps1 -Rollback
@@ -128,20 +217,36 @@ Options:
 
 ```
 Modes (mutually exclusive):
-  -Audit                  Audit only, no changes made
+  -Audit                  Audit only, no changes
   -Install                Non-interactive install
   -Rollback               Undo all script-managed changes
   (no flag)               Audit + interactive menu
 
-Options:
-  -TestConnection         Include TLS handshake test in audit
-  -TestHost <hostname>    TLS test target (default: login.microsoftonline.com)
-  -BundleDir <path>       Output directory for PEM files (default: $env:USERPROFILE\certs)
-  -PatchAzureCli          Patch Azure CLI certifi bundle
-  -Scope User|Machine     Env var scope (default: User; Machine needs admin)
+Cert sources:
   -CertUrls <string[]>    URLs to fetch certificates from
-  -CertUrlTimeoutSec <n>  Per-URL timeout in seconds (default: 10)
-  -Force                  Skip confirmation with -Rollback
+  -CertUrlTimeoutSec <n>  Per-URL timeout, seconds (default: 10)
+  -BundleDir <path>       Output directory for bundles (default: %USERPROFILE%\certs)
+
+Patch / install switches (only with -Install):
+  -InstallToCertStore     Import to Cert:\LocalMachine\Root (admin) or
+                          Cert:\CurrentUser\Root (no admin)
+  -PatchAzureCli          Patch Azure CLI's bundled certifi cacert.pem
+  -PatchGit               git config --global http.sslCAInfo
+  -PatchNpm               npm config set cafile
+  -PatchJava              keytool import into JVM cacerts (usually needs admin)
+  -PatchAws               aws configure set default.ca_bundle
+  -PatchGcloud            gcloud config set core/custom_ca_certs_file
+  -PatchPip               pip config set global.cert (generic Python)
+  -PatchCurl              Write cacert= block to %USERPROFILE%\_curlrc
+  -PatchWget              Write ca_certificate= block to %USERPROFILE%\.wgetrc
+  -PatchComposer          Write openssl.cafile= block to php.ini
+  -PatchAll               Turn on every -Patch* flag plus -InstallToCertStore
+
+Other:
+  -TestConnection         Live TLS handshake test in audit
+  -TestHost <hostname>    TLS test target (default: login.microsoftonline.com)
+  -Scope User|Machine     Env var scope (default: User; Machine needs admin)
+  -Force                  With -Rollback: skip the y/N confirmation prompt
 ```
 
 ---
@@ -150,54 +255,62 @@ Options:
 
 ### Environment Variables
 
-The scripts set the following environment variables so that common tools trust the Zscaler certificate:
+Each script writes a marker-fenced block (`# >>> Zscaler Trust Configuration ... >>>` / `... <<<`) so rollback can remove exactly what it added without disturbing other shell-profile contents.
 
 | Variable | Used By |
 |----------|---------|
-| `REQUESTS_CA_BUNDLE` | Python `requests` library |
-| `SSL_CERT_FILE` | OpenSSL-based tools |
+| `REQUESTS_CA_BUNDLE` | Python `requests` library, AWS Boto, Databricks Connect |
+| `SSL_CERT_FILE` | OpenSSL-based tools, Ruby/gem |
 | `CURL_CA_BUNDLE` | curl |
-| `NODE_EXTRA_CA_CERTS` | Node.js |
+| `NODE_EXTRA_CA_CERTS` | Node.js, npm, yarn |
 | `PIP_CERT` | pip |
+
+Scopes:
+- **Linux user scope** — appended to `~/.bashrc` / `~/.zshrc`
+- **Linux system scope** — `/etc/profile.d/zscaler-trust.sh`
+- **macOS user scope** — appended to `~/.zshrc` / `~/.bash_profile`
+- **macOS system scope** — `/etc/zscaler-trust.sh`, sourced from `/etc/zprofile` and `/etc/profile`
+- **Windows User scope** — `[Environment]::SetEnvironmentVariable(..., 'User')`
+- **Windows Machine scope** — `[Environment]::SetEnvironmentVariable(..., 'Machine')`
 
 ### Generated Files
 
 | File | Description |
 |------|-------------|
-| `~/certs/zscaler-certs.pem` | Extracted Zscaler root certificate(s) |
-| `~/certs/combined-ca-bundle.pem` | System CA bundle combined with Zscaler certs |
+| `~/certs/zscaler-certs.pem` (or `%USERPROFILE%\certs\` on Windows) | Extracted Zscaler root certificate(s) |
+| `~/certs/combined-ca-bundle.pem` | System CA bundle with Zscaler certs appended |
 
-### Tool-Specific Patches
-
-| Tool | What Changes |
-|------|-------------|
-| Azure CLI | Appends Zscaler cert to the bundled `certifi` CA file |
-| Git | Sets `http.sslCAInfo` to the combined bundle |
-| npm | Sets `cafile` configuration to the combined bundle |
-| Java | Imports the cert into the JVM keystore via `keytool` |
+Both paths are configurable via `--bundle-dir` / `-BundleDir`.
 
 ---
 
 ## Certificate Sources
 
-The scripts can discover Zscaler certificates from multiple sources:
+The scripts can discover Zscaler certificates from:
 
-- **Windows Certificate Store** (PowerShell) -- `LocalMachine\Root`, `LocalMachine\CA`, `CurrentUser\Root`, etc.
-- **Local PEM file** -- via `--cert-file` / direct input
-- **HTTP download** -- `.cer`, `.crt`, `.pem`, `.der` files from a URL
-- **TLS handshake capture** -- connects to a host and extracts the presented certificate chain
-- **System trust store** (Linux) -- scans `/etc/pki/ca-trust` or `/usr/share/ca-certificates`
+- **Windows Certificate Store** (PowerShell) -- `LocalMachine\Root`, `LocalMachine\CA`, `LocalMachine\AuthRoot`, `CurrentUser\Root`, `CurrentUser\CA`
+- **macOS Keychains** -- `/Library/Keychains/System.keychain`, `~/Library/Keychains/login.keychain-db`, Apple's read-only System Roots keychain, `/etc/ssl/cert.pem`
+- **Linux system trust store** -- `/etc/pki/ca-trust` (RHEL family) or `/usr/local/share/ca-certificates/` and `/etc/ssl/certs/ca-certificates.crt` (Debian family)
+- **Local PEM/DER file** -- via `--cert-file` (bash scripts)
+- **HTTP download** -- `.cer`, `.crt`, `.pem`, `.der` from a URL (auto-detects DER vs PEM)
+- **TLS handshake capture** -- connect to a host and extract the CA portion of the presented chain
 
 ---
 
 ## Requirements
 
 ### Linux/Unix
-- Bash shell
-- `openssl`, `awk`, `sed`, `grep`, `mktemp`
-- `curl` or `wget` (only needed for `--cert-url`)
-- Root access (only needed for `--scope system`)
+- Bash, `openssl`, `awk`, `sed`, `grep`, `mktemp`
+- `curl` or `wget` (only for `--cert-url`)
+- Root access for `--scope system` and `--patch-java` (and `--patch-composer` if `php.ini` is in a system path)
+
+### macOS
+- macOS 10.15+ (Catalina or later)
+- Bash 3.2+ or zsh 5+
+- `openssl`, `security`, `awk`, `sed`, `grep`, `mktemp` — all in macOS base or Xcode Command Line Tools
+- `sudo` for `--scope system`, System keychain install, or `--patch-java`
+- Homebrew is detected if present but not required
 
 ### Windows
 - PowerShell 5.0+
-- Administrator privileges (only needed for `-Scope Machine` or `-PatchAzureCli`)
+- Administrator privileges for `-Scope Machine`, `-InstallToCertStore` (when targeting LocalMachine), `-PatchAzureCli`, `-PatchJava`, or `-PatchComposer` if `php.ini` is in a system path
