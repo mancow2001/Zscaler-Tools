@@ -22,30 +22,30 @@ All three scripts share the same workflow: **Audit** the current trust state, **
 
 ## Application coverage
 
-Each row maps to a section in the Zscaler help guide. ✅ = configured automatically (audit + install + rollback). ⚙️ = covered indirectly by env vars the script sets. ➖ = N/A on that platform.
+Each row maps to a section in the Zscaler help guide. **Yes** = configured automatically (audit + install + rollback). **Indirect** = covered by env vars the script already sets, no per-tool config written. **N/A** = not applicable on that platform. **No** = intentionally not handled.
 
 | Application | What the script does | Linux | macOS | Windows |
 |---|---|:---:|:---:|:---:|
-| System trust store | Install root certs to the OS store (sudo / admin) | ✅ `update-ca-trust` / `update-ca-certificates` | ✅ System + Login keychain | ✅ `Cert:\LocalMachine\Root` + `CurrentUser\Root` |
-| Python `requests` | `REQUESTS_CA_BUNDLE` env var | ✅ | ✅ | ✅ |
-| pip env vars | `PIP_CERT`, `SSL_CERT_FILE` | ✅ | ✅ | ✅ |
-| pip config | `pip config set global.cert <bundle>` | ✅ `--patch-pip` | ✅ `--patch-pip` | ✅ `-PatchPip` |
-| pip-system-certs | Install package into Azure CLI Python | ✅ | ✅ | ✅ |
-| npm | `cafile` + `NODE_EXTRA_CA_CERTS` | ✅ `--patch-npm` | ✅ `--patch-npm` | ✅ `-PatchNpm` |
-| Java keytool | Import into JVM `cacerts` | ✅ `--patch-java` | ✅ `--patch-java` | ✅ `-PatchJava` |
-| Git | `git config --global http.sslCAInfo` | ✅ `--patch-git` | ✅ `--patch-git` | ✅ `-PatchGit` |
-| cURL | `cacert=` block in `~/.curlrc` (or `_curlrc` on Windows) + `CURL_CA_BUNDLE` | ✅ `--patch-curl` | ✅ `--patch-curl` | ✅ `-PatchCurl` |
-| GNU Wget | `ca_certificate=` block in `~/.wgetrc` | ✅ `--patch-wget` | ✅ `--patch-wget` | ✅ `-PatchWget` |
-| AWS CLI / Boto | `aws configure set default.ca_bundle` | ✅ `--patch-aws` | ✅ `--patch-aws` | ✅ `-PatchAws` |
-| Google Cloud SDK | `gcloud config set core/custom_ca_certs_file` | ✅ `--patch-gcloud` | ✅ `--patch-gcloud` | ✅ `-PatchGcloud` |
-| Azure CLI | Append cert to bundled `certifi` cacert.pem | ✅ `--patch-azure-cli` | ✅ `--patch-azure-cli` | ✅ `-PatchAzureCli` |
-| Composer (PHP) | `openssl.cafile=` block in loaded `php.ini` | ✅ `--patch-composer` | ✅ `--patch-composer` | ✅ `-PatchComposer` |
-| Ruby / gem | `SSL_CERT_FILE` env var | ⚙️ | ⚙️ | ⚙️ |
-| Databricks Connect | `REQUESTS_CA_BUNDLE` env var | ⚙️ | ⚙️ | ⚙️ |
-| Rust (Linux) | OS trust store | ⚙️ | ➖ | ➖ |
-| Fastlane (Linux) | OS trust store | ⚙️ | ➖ | ➖ |
-| Snowflake ODBC | not configured — Snowflake uses cert pinning, requires SSL-inspection bypass list (see help guide) | ❌ | ❌ | ❌ |
-| Android Studio, IntelliJ, Firefox, Edge, Salesforce Data Loader | not configured — GUI-driven or very narrow audience | ❌ | ❌ | ❌ |
+| System trust store | Install root certs to the OS store (sudo / admin) | Yes (`update-ca-trust` / `update-ca-certificates`) | Yes (System + Login keychain) | Yes (`Cert:\LocalMachine\Root` + `CurrentUser\Root`) |
+| Python `requests` | `REQUESTS_CA_BUNDLE` env var | Yes | Yes | Yes |
+| pip env vars | `PIP_CERT`, `SSL_CERT_FILE` | Yes | Yes | Yes |
+| pip config | `pip config set global.cert <bundle>` | Yes (`--patch-pip`) | Yes (`--patch-pip`) | Yes (`-PatchPip`) |
+| pip-system-certs | Install package into Azure CLI Python | Yes | Yes | Yes |
+| npm | `cafile` + `NODE_EXTRA_CA_CERTS` | Yes (`--patch-npm`) | Yes (`--patch-npm`) | Yes (`-PatchNpm`) |
+| Java keytool | Import into JVM `cacerts` | Yes (`--patch-java`) | Yes (`--patch-java`) | Yes (`-PatchJava`) |
+| Git | `git config --global http.sslCAInfo` | Yes (`--patch-git`) | Yes (`--patch-git`) | Yes (`-PatchGit`) |
+| cURL | `cacert=` block in `~/.curlrc` (or `_curlrc` on Windows) + `CURL_CA_BUNDLE` | Yes (`--patch-curl`) | Yes (`--patch-curl`) | Yes (`-PatchCurl`) |
+| GNU Wget | `ca_certificate=` block in `~/.wgetrc` | Yes (`--patch-wget`) | Yes (`--patch-wget`) | Yes (`-PatchWget`) |
+| AWS CLI / Boto | `aws configure set default.ca_bundle` | Yes (`--patch-aws`) | Yes (`--patch-aws`) | Yes (`-PatchAws`) |
+| Google Cloud SDK | `gcloud config set core/custom_ca_certs_file` | Yes (`--patch-gcloud`) | Yes (`--patch-gcloud`) | Yes (`-PatchGcloud`) |
+| Azure CLI | Append cert to bundled `certifi` cacert.pem | Yes (`--patch-azure-cli`) | Yes (`--patch-azure-cli`) | Yes (`-PatchAzureCli`) |
+| Composer (PHP) | `openssl.cafile=` block in loaded `php.ini` | Yes (`--patch-composer`) | Yes (`--patch-composer`) | Yes (`-PatchComposer`) |
+| Ruby / gem | `SSL_CERT_FILE` env var | Indirect | Indirect | Indirect |
+| Databricks Connect | `REQUESTS_CA_BUNDLE` env var | Indirect | Indirect | Indirect |
+| Rust (Linux) | OS trust store | Indirect | N/A | N/A |
+| Fastlane (Linux) | OS trust store | Indirect | N/A | N/A |
+| Snowflake ODBC | not configured — Snowflake uses cert pinning, requires SSL-inspection bypass list (see help guide) | No | No | No |
+| Android Studio, IntelliJ, Firefox, Edge, Salesforce Data Loader | not configured — GUI-driven or very narrow audience | No | No | No |
 
 ---
 
