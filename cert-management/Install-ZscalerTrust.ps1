@@ -155,6 +155,45 @@ function Test-IsAdmin {
     $p.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Invoke-Native {
+    <#
+        Run a native command, swallow stderr, and never throw under
+        $ErrorActionPreference = 'Stop'.
+
+        Returns a pscustomobject:
+          Stdout   - trimmed stdout as a single string (or '' if none)
+          ExitCode - the native exit code
+          Success  - $true iff ExitCode -eq 0
+
+        Why this exists: in PowerShell 5.1, native commands that write to
+        stderr (e.g. `pip config get` for a missing key) get wrapped as a
+        NativeCommandError record. With $EAP='Stop' that becomes terminating
+        even though `2>$null` redirects the textual stream. Routing every
+        opportunistic native call through this helper keeps the audit and
+        rollback paths from blowing up on routine "key is unset" output.
+    #>
+    param([Parameter(Mandatory=$true)][scriptblock]$ScriptBlock)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $merged = & $ScriptBlock 2>&1
+        $exit   = $LASTEXITCODE
+        $stdout = @(
+            $merged | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
+                      ForEach-Object { "$_" }
+        ) -join "`n"
+        return [pscustomobject]@{
+            Stdout   = $stdout.Trim()
+            ExitCode = $exit
+            Success  = ($exit -eq 0)
+        }
+    } catch {
+        return [pscustomobject]@{ Stdout = ''; ExitCode = -1; Success = $false }
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
 function ConvertTo-Pem {
     param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert)
     $b64 = [Convert]::ToBase64String($Cert.RawData)
@@ -264,36 +303,28 @@ function Get-PythonInterpreters {
 
     $pyLauncher = (Get-Command py -ErrorAction SilentlyContinue).Source
     if ($pyLauncher) {
-        try {
-            $resolved = & $pyLauncher -c "import sys; print(sys.executable)" 2>$null
-            if ($LASTEXITCODE -eq 0 -and $resolved) {
-                $rp = $resolved.Trim()
-                if ($rp -ne $sysPy -and $rp -ne $azPy) {
-                    $list += [pscustomobject]@{ Label = 'py launcher default'; Path = $rp }
-                }
+        $r = Invoke-Native { & $pyLauncher -c "import sys; print(sys.executable)" }
+        if ($r.Success -and $r.Stdout) {
+            $rp = $r.Stdout
+            if ($rp -ne $sysPy -and $rp -ne $azPy) {
+                $list += [pscustomobject]@{ Label = 'py launcher default'; Path = $rp }
             }
-        } catch { }
+        }
     }
     $list
 }
 
 function Get-CertifiPath {
     param([string]$PythonExe)
-    try {
-        $out = & $PythonExe -c "import certifi; print(certifi.where())" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $out) { return $out.Trim() }
-    } catch { }
+    $r = Invoke-Native { & $PythonExe -c "import certifi; print(certifi.where())" }
+    if ($r.Success -and $r.Stdout) { return $r.Stdout }
     return $null
 }
 
 function Test-PipPackage {
     param([string]$PythonExe, [string]$Package)
-    try {
-        & $PythonExe -m pip show $Package 2>$null | Out-Null
-        return ($LASTEXITCODE -eq 0)
-    } catch {
-        return $false
-    }
+    $r = Invoke-Native { & $PythonExe -m pip show $Package }
+    return $r.Success
 }
 
 function Test-IsScriptBundle {
@@ -690,8 +721,7 @@ function Invoke-Audit {
 
     # git
     if (Get-Command git -ErrorAction SilentlyContinue) {
-        $gitCa = & git config --global --get http.sslCAInfo 2>$null
-        $gitCa = "$gitCa".Trim()
+        $gitCa = (Invoke-Native { & git config --global --get http.sslCAInfo }).Stdout
         if ($gitCa) {
             if (Test-Path $gitCa) {
                 $r = Test-BundleHasCerts -BundlePath $gitCa -Certs $managedCerts
@@ -713,8 +743,7 @@ function Invoke-Audit {
 
     # npm
     if (Get-Command npm -ErrorAction SilentlyContinue) {
-        $npmCa = & npm config get cafile 2>$null
-        $npmCa = "$npmCa".Trim()
+        $npmCa = (Invoke-Native { & npm config get cafile }).Stdout
         if ($npmCa -and $npmCa -ne 'undefined' -and $npmCa -ne 'null') {
             if (Test-Path $npmCa) {
                 $r = Test-BundleHasCerts -BundlePath $npmCa -Certs $managedCerts
@@ -740,7 +769,7 @@ function Invoke-Audit {
         if ($javaHome) {
             $cacerts = Join-Path $javaHome 'lib\security\cacerts'
             if (Test-Path $cacerts) {
-                $listing = & keytool -list -keystore $cacerts -storepass changeit 2>$null
+                $listing = (Invoke-Native { & keytool -list -keystore $cacerts -storepass changeit }).Stdout
                 if ($listing -and ($listing -match 'zscaler')) {
                     Write-Status OK "Java keystore contains Zscaler cert(s)"
                     $result.JavaConfigured = $true
@@ -1068,12 +1097,21 @@ function Invoke-InstallPipSystemCerts {
     }
 
     Write-Section "Installing pip-system-certs in $PythonExe"
-    & $PythonExe -m pip install pip-system-certs
-    if ($LASTEXITCODE -eq 0) {
+    # Merge stderr into stdout so pip's progress/warnings don't get wrapped as
+    # NativeCommandError records under $EAP='Stop'. Output stays visible.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $PythonExe -m pip install pip-system-certs 2>&1
+        $exit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    if ($exit -eq 0) {
         Write-Status OK "Installed. Azure CLI Python now reads the Windows trust store directly."
         return $true
     } else {
-        Write-Status FAIL "pip install failed (exit $LASTEXITCODE)"
+        Write-Status FAIL "pip install failed (exit $exit)"
         return $false
     }
 }
@@ -1143,12 +1181,12 @@ function Invoke-ConfigureGit {
     }
 
     Write-Section "Configuring git http.sslCAInfo"
-    & git config --global http.sslCAInfo $BundlePath
-    if ($LASTEXITCODE -eq 0) {
+    $r = Invoke-Native { & git config --global http.sslCAInfo $BundlePath }
+    if ($r.Success) {
         Write-Status OK "git config --global http.sslCAInfo $BundlePath"
         return $true
     }
-    Write-Status FAIL "git config failed (exit $LASTEXITCODE)"
+    Write-Status FAIL "git config failed (exit $($r.ExitCode))"
     return $false
 }
 
@@ -1161,12 +1199,12 @@ function Invoke-ConfigureNpm {
     }
 
     Write-Section "Configuring npm cafile"
-    & npm config set cafile $BundlePath
-    if ($LASTEXITCODE -eq 0) {
+    $r = Invoke-Native { & npm config set cafile $BundlePath }
+    if ($r.Success) {
         Write-Status OK "npm config set cafile $BundlePath"
         return $true
     }
-    Write-Status FAIL "npm config set cafile failed (exit $LASTEXITCODE)"
+    Write-Status FAIL "npm config set cafile failed (exit $($r.ExitCode))"
     return $false
 }
 
@@ -1246,16 +1284,16 @@ function Invoke-ConfigureJavaKeystore {
             Set-Content -Path $file -Value (ConvertTo-Pem $c) -Encoding Ascii
 
             # Skip if alias already present.
-            & $keytool -list -keystore $cacerts -storepass changeit -alias $alias 2>$null | Out-Null
-            if ($LASTEXITCODE -eq 0) {
+            $rl = Invoke-Native { & $keytool -list -keystore $cacerts -storepass changeit -alias $alias }
+            if ($rl.Success) {
                 Write-Status INFO "Already in keystore: $alias ($cn)"
                 $idx++
                 continue
             }
 
-            & $keytool -importcert -noprompt -keystore $cacerts -storepass changeit `
-                       -alias $alias -file $file 2>$null
-            if ($LASTEXITCODE -eq 0) {
+            $ri = Invoke-Native { & $keytool -importcert -noprompt -keystore $cacerts -storepass changeit `
+                                              -alias $alias -file $file }
+            if ($ri.Success) {
                 Write-Status OK "Imported: $alias ($cn)"
             } else {
                 Write-Status FAIL "Failed to import: $alias ($cn)"
@@ -1293,22 +1331,21 @@ function Invoke-ConfigureAwsCli {
         return $false
     }
     Write-Section "Configuring AWS CLI default.ca_bundle"
-    & aws configure set default.ca_bundle $BundlePath
-    if ($LASTEXITCODE -eq 0) {
+    $r = Invoke-Native { & aws configure set default.ca_bundle $BundlePath }
+    if ($r.Success) {
         Write-Status OK "aws configure set default.ca_bundle $BundlePath"
         return $true
     }
-    Write-Status FAIL "aws configure set failed (exit $LASTEXITCODE)"
+    Write-Status FAIL "aws configure set failed (exit $($r.ExitCode))"
     return $false
 }
 
 function Get-GcloudCaBundle {
     if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) { return $null }
-    $val = & gcloud config get-value core/custom_ca_certs_file 2>$null
-    if ($LASTEXITCODE -ne 0) { return $null }
-    $val = "$val".Trim()
-    if (-not $val -or $val -eq '(unset)') { return $null }
-    return $val
+    $r = Invoke-Native { & gcloud config get-value core/custom_ca_certs_file }
+    if (-not $r.Success -or -not $r.Stdout) { return $null }
+    if ($r.Stdout -eq '(unset)') { return $null }
+    return $r.Stdout
 }
 
 function Invoke-ConfigureGcloud {
@@ -1318,12 +1355,12 @@ function Invoke-ConfigureGcloud {
         return $false
     }
     Write-Section "Configuring gcloud core/custom_ca_certs_file"
-    & gcloud config set core/custom_ca_certs_file $BundlePath
-    if ($LASTEXITCODE -eq 0) {
+    $r = Invoke-Native { & gcloud config set core/custom_ca_certs_file $BundlePath }
+    if ($r.Success) {
         Write-Status OK "gcloud config set core/custom_ca_certs_file $BundlePath"
         return $true
     }
-    Write-Status FAIL "gcloud config set failed (exit $LASTEXITCODE)"
+    Write-Status FAIL "gcloud config set failed (exit $($r.ExitCode))"
     return $false
 }
 
@@ -1337,11 +1374,10 @@ function Find-PipCommand {
 function Get-PipConfigCert {
     $pip = Find-PipCommand
     if (-not $pip) { return $null }
-    $val = & $pip config get global.cert 2>$null
-    if (-not $val) { return $null }
-    $val = "$val".Trim()
-    if ($val -like 'ERROR:*') { return $null }
-    return $val
+    $r = Invoke-Native { & $pip config get global.cert }
+    if (-not $r.Success -or -not $r.Stdout) { return $null }
+    if ($r.Stdout -like 'ERROR:*') { return $null }
+    return $r.Stdout
 }
 
 function Invoke-ConfigurePipGlobalCert {
@@ -1352,12 +1388,12 @@ function Invoke-ConfigurePipGlobalCert {
         return $false
     }
     Write-Section "Configuring pip global.cert"
-    & $pip config set global.cert $BundlePath
-    if ($LASTEXITCODE -eq 0) {
+    $r = Invoke-Native { & $pip config set global.cert $BundlePath }
+    if ($r.Success) {
         Write-Status OK "$pip config set global.cert $BundlePath"
         return $true
     }
-    Write-Status FAIL "$pip config set global.cert failed (exit $LASTEXITCODE)"
+    Write-Status FAIL "$pip config set global.cert failed (exit $($r.ExitCode))"
     return $false
 }
 
@@ -1463,8 +1499,9 @@ function Invoke-ConfigureWgetRc {
 
 function Get-PhpIni {
     if (-not (Get-Command php -ErrorAction SilentlyContinue)) { return $null }
-    $output = & php --ini 2>$null
-    foreach ($line in $output) {
+    $r = Invoke-Native { & php --ini }
+    if (-not $r.Stdout) { return $null }
+    foreach ($line in ($r.Stdout -split "`n")) {
         if ($line -match '^\s*Loaded Configuration File:\s*(.+)\s*$') {
             $ini = $matches[1].Trim()
             if ($ini -eq '(none)') { return $null }
@@ -1590,8 +1627,7 @@ function Invoke-RollbackAll {
 
     # ---- git config ----
     if (Get-Command git -ErrorAction SilentlyContinue) {
-        $gitSsl = (& git config --global --get http.sslCAInfo 2>$null)
-        $gitSsl = "$gitSsl".Trim()
+        $gitSsl = (Invoke-Native { & git config --global --get http.sslCAInfo }).Stdout
         if ($gitSsl -and (Test-IsScriptBundle $gitSsl)) {
             $plan += [pscustomobject]@{
                 Kind       = 'UnsetGitConfig'
@@ -1604,8 +1640,7 @@ function Invoke-RollbackAll {
 
     # ---- npm config ----
     if (Get-Command npm -ErrorAction SilentlyContinue) {
-        $npmCa = (& npm config get cafile 2>$null)
-        $npmCa = "$npmCa".Trim()
+        $npmCa = (Invoke-Native { & npm config get cafile }).Stdout
         if ($npmCa -and $npmCa -ne 'undefined' -and $npmCa -ne 'null' -and (Test-IsScriptBundle $npmCa)) {
             $plan += [pscustomobject]@{
                 Kind       = 'UnsetNpmConfig'
@@ -1621,7 +1656,7 @@ function Invoke-RollbackAll {
     if ((Get-Command keytool -ErrorAction SilentlyContinue) -and $javaHome) {
         $cacerts = Join-Path $javaHome 'lib\security\cacerts'
         if (Test-Path $cacerts) {
-            $listing = & keytool -list -keystore $cacerts -storepass changeit 2>$null
+            $listing = (Invoke-Native { & keytool -list -keystore $cacerts -storepass changeit }).Stdout
             if ($listing -and ($listing -match 'zscaler')) {
                 $plan += [pscustomobject]@{
                     Kind       = 'RemoveJavaKeystoreCerts'
@@ -1798,37 +1833,44 @@ function Invoke-RollbackAll {
                     }
                 }
                 'UninstallPipSystemCerts' {
-                    & $p.Target -m pip uninstall -y pip-system-certs
-                    if ($LASTEXITCODE -eq 0) {
+                    $prev = $ErrorActionPreference
+                    $ErrorActionPreference = 'Continue'
+                    try {
+                        & $p.Target -m pip uninstall -y pip-system-certs 2>&1
+                        $exit = $LASTEXITCODE
+                    } finally {
+                        $ErrorActionPreference = $prev
+                    }
+                    if ($exit -eq 0) {
                         Write-Status OK "Uninstalled pip-system-certs"
                     } else {
-                        Write-Status FAIL "pip uninstall failed (exit $LASTEXITCODE)"
+                        Write-Status FAIL "pip uninstall failed (exit $exit)"
                     }
                 }
                 'UnsetGitConfig' {
-                    & git config --global --unset http.sslCAInfo 2>$null
-                    if ($LASTEXITCODE -eq 0) {
+                    $r = Invoke-Native { & git config --global --unset http.sslCAInfo }
+                    if ($r.Success) {
                         Write-Status OK "Unset: git http.sslCAInfo"
                     } else {
-                        Write-Status FAIL "Failed to unset git config (exit $LASTEXITCODE)"
+                        Write-Status FAIL "Failed to unset git config (exit $($r.ExitCode))"
                     }
                 }
                 'UnsetNpmConfig' {
-                    & npm config delete cafile 2>$null
-                    if ($LASTEXITCODE -eq 0) {
+                    $r = Invoke-Native { & npm config delete cafile }
+                    if ($r.Success) {
                         Write-Status OK "Removed: npm cafile"
                     } else {
-                        Write-Status FAIL "Failed to remove npm cafile (exit $LASTEXITCODE)"
+                        Write-Status FAIL "Failed to remove npm cafile (exit $($r.ExitCode))"
                     }
                 }
                 'RemoveJavaKeystoreCerts' {
                     $cacerts = $p.Target
-                    $listing = & keytool -list -keystore $cacerts -storepass changeit 2>$null
-                    foreach ($line in $listing) {
+                    $listing = (Invoke-Native { & keytool -list -keystore $cacerts -storepass changeit }).Stdout
+                    foreach ($line in ($listing -split "`n")) {
                         if ($line -match '^([^,]+),.*zscaler' -or $line -match '^(zscaler[^,]*),') {
                             $alias = $matches[1].Trim()
-                            & keytool -delete -keystore $cacerts -storepass changeit -alias $alias 2>$null
-                            if ($LASTEXITCODE -eq 0) {
+                            $rd = Invoke-Native { & keytool -delete -keystore $cacerts -storepass changeit -alias $alias }
+                            if ($rd.Success) {
                                 Write-Status OK "Removed from keystore: $alias"
                             } else {
                                 Write-Status FAIL "Failed to remove: $alias"
@@ -1856,19 +1898,20 @@ function Invoke-RollbackAll {
                     }
                 }
                 'UnsetGcloudCaCerts' {
-                    & gcloud config unset core/custom_ca_certs_file 2>$null
-                    if ($LASTEXITCODE -eq 0) {
+                    $r = Invoke-Native { & gcloud config unset core/custom_ca_certs_file }
+                    if ($r.Success) {
                         Write-Status OK "Unset: gcloud core/custom_ca_certs_file"
                     } else {
-                        Write-Status FAIL "Failed to unset gcloud config (exit $LASTEXITCODE)"
+                        Write-Status FAIL "Failed to unset gcloud config (exit $($r.ExitCode))"
                     }
                 }
                 'UnsetPipGlobalCert' {
-                    & $p.PipBin config unset global.cert 2>$null
-                    if ($LASTEXITCODE -eq 0) {
+                    $pb = $p.PipBin
+                    $r = Invoke-Native { & $pb config unset global.cert }
+                    if ($r.Success) {
                         Write-Status OK "Unset: $($p.PipBin) global.cert"
                     } else {
-                        Write-Status FAIL "Failed to unset $($p.PipBin) global.cert (exit $LASTEXITCODE)"
+                        Write-Status FAIL "Failed to unset $($p.PipBin) global.cert (exit $($r.ExitCode))"
                     }
                 }
                 'RemoveRcfileBlock' {
